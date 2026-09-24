@@ -480,6 +480,16 @@ class Settings:
 
     claude_bin: str = os.environ.get("CLAUDE_BIN", "claude")
     claude_model: str | None = (_env_str("CLAUDE_MODEL", "").strip() or None)
+    # Run the Claude CLI as a plain chat model: no tools, MCP servers, settings or skills, a
+    # neutral system prompt, no session files and a minimal environment, so it cannot read or
+    # reveal the host, its files or its credentials. Set CLAUDE_ISOLATED=0 for agent mode.
+    claude_isolated: bool = _env_bool("CLAUDE_ISOLATED", True)
+    claude_system_prompt: str = _env_str(
+        "CLAUDE_SYSTEM_PROMPT",
+        "You are Claude, a helpful AI assistant made by Anthropic. You have no tools and no "
+        "access to any computer, files, network or runtime environment. Do not describe or "
+        "speculate about the infrastructure this conversation runs on.",
+    )
     # Claude direct OAuth mode (CLIProxyAPI-style). When enabled, the gateway calls the
     # upstream Anthropic HTTP API directly, using a locally cached OAuth access token.
     # This avoids subprocess overhead and supports true SSE streaming.

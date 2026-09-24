@@ -47,6 +47,7 @@ async def iter_stream_json_events(
     stream_limit: int,
     event_callback: Callable[[dict], None] | None = None,
     stderr_callback: Callable[[str], None] | None = None,
+    cwd: str | None = None,
 ) -> AsyncIterator[dict]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -55,6 +56,7 @@ async def iter_stream_json_events(
         stderr=asyncio.subprocess.PIPE,
         limit=stream_limit,
         env=env or os.environ.copy(),
+        cwd=cwd,
     )
 
     stderr_buf: bytearray = bytearray()

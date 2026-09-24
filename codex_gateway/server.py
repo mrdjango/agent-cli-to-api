@@ -351,6 +351,60 @@ def _extract_codex_session_id(req: ChatCompletionRequest, request: Request) -> s
     return None
 
 
+# Environment variables the Claude CLI subprocess may inherit in isolated mode.
+_CLAUDE_ENV_ALLOWLIST = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+)
+
+
+def _claude_cli_cmd(claude_model: str | None, prompt: str) -> list[str]:
+    cmd = [settings.claude_bin, "--verbose", "-p", "--output-format", "stream-json"]
+    if settings.claude_isolated:
+        cmd.extend(
+            [
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "",
+                "--disable-slash-commands",
+                "--no-session-persistence",
+                "--system-prompt",
+                settings.claude_system_prompt,
+            ]
+        )
+    else:
+        cmd.extend(["--add-dir", settings.workspace])
+        for d in settings.add_dirs:
+            cmd.extend(["--add-dir", d])
+    if claude_model:
+        cmd.extend(["--model", claude_model])
+    cmd.append("--")
+    cmd.append(prompt)
+    return cmd
+
+
+def _claude_cli_env() -> dict[str, str] | None:
+    if not settings.claude_isolated:
+        return None
+    env = {k: v for k in _CLAUDE_ENV_ALLOWLIST if (v := os.environ.get(k))}
+    env.update(
+        DISABLE_AUTOUPDATER="1",
+        DISABLE_TELEMETRY="1",
+        DISABLE_ERROR_REPORTING="1",
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+    )
+    return env
+
+
 def _parse_provider_model(model: str) -> tuple[str, str | None]:
     raw = (model or "").strip()
     if not raw:
@@ -2496,31 +2550,18 @@ async def chat_completions(
                             )
                             text, usage = await claude_oauth_generate(req=req2, model_name=claude_model)
                         else:
-                            cmd = [
-                                settings.claude_bin,
-                                "--verbose",
-                                "-p",
-                                "--output-format",
-                                "stream-json",
-                                "--add-dir",
-                                settings.workspace,
-                            ]
-                            for d in settings.add_dirs:
-                                cmd.extend(["--add-dir", d])
-                            if claude_model:
-                                cmd.extend(["--model", claude_model])
-                            cmd.append("--")
-                            cmd.append(prompt)
+                            cmd = _claude_cli_cmd(claude_model, prompt)
 
                             assembler = TextAssembler()
                             fallback_text = None
                             async for evt in iter_stream_json_events(
                                 cmd=cmd,
-                                env=None,
+                                env=_claude_cli_env(),
                                 timeout_seconds=settings.timeout_seconds,
                                 stream_limit=settings.subprocess_stream_limit,
                                 event_callback=_evt_log,
                                 stderr_callback=_stderr_log,
+                                cwd=settings.workspace,
                             ):
                                 extract_claude_delta(evt, assembler)
                                 maybe_usage = extract_usage_from_claude_result(evt)
@@ -2782,28 +2823,15 @@ async def chat_completions(
                                 )
                                 events = iter_claude_oauth_events(req=req2, model_name=claude_model)
                             else:
-                                cmd = [
-                                    settings.claude_bin,
-                                    "--verbose",
-                                    "-p",
-                                    "--output-format",
-                                    "stream-json",
-                                    "--add-dir",
-                                    settings.workspace,
-                                ]
-                                for d in settings.add_dirs:
-                                    cmd.extend(["--add-dir", d])
-                                if claude_model:
-                                    cmd.extend(["--model", claude_model])
-                                cmd.append("--")
-                                cmd.append(prompt)
+                                cmd = _claude_cli_cmd(claude_model, prompt)
                                 events = iter_stream_json_events(
                                     cmd=cmd,
-                                    env=None,
+                                    env=_claude_cli_env(),
                                     timeout_seconds=settings.timeout_seconds,
                                     stream_limit=settings.subprocess_stream_limit,
                                     event_callback=_evt_log,
                                     stderr_callback=_stderr_log,
+                                    cwd=settings.workspace,
                                 )
                         elif provider == "gemini":
                             gemini_model = provider_model or settings.gemini_model or "gemini-3-flash-preview"
