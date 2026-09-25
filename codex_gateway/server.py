@@ -405,6 +405,80 @@ def _claude_cli_env() -> dict[str, str] | None:
     return env
 
 
+# Loose Claude names such as "opus", "sonnet-5", "opus-5.5" or "claude opus 5.5[1m]".
+_CLAUDE_LOOSE_NAME_RE = re.compile(
+    r"^(?:claude[-_ ]?)?(opus|sonnet|haiku|fable)(?:[-_ .]?(\d+)(?:[-_.](\d+))?)?(\[1m\])?$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_claude_model_name(name: str) -> str | None:
+    """Map Anthropic-style model names to what the Claude CLI accepts, or None if not Claude."""
+    raw = (name or "").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("claude-"):
+        # Full model ID (e.g. claude-opus-5-5, claude-haiku-4-5-20251001); the CLI validates it.
+        return raw
+    m = _CLAUDE_LOOSE_NAME_RE.match(raw)
+    if not m:
+        return None
+    family, major, minor, one_m = m.groups()
+    family = family.lower()
+    suffix = one_m or ""
+    if not major:
+        return family + suffix
+    version = major if not minor else f"{major}-{minor}"
+    return f"claude-{family}-{version}{suffix}"
+
+
+_CODEX_MODEL_NAME_RE = re.compile(r"^(?:gpt-|o\d|codex-)", re.IGNORECASE)
+
+
+def _strict_model_error(requested_model: str, provider: str, provider_model: str | None) -> str | None:
+    """In strict mode, explain why a request's model can't be served as named (else None)."""
+    if not settings.strict_models:
+        return None
+    if not requested_model:
+        return "A model is required, e.g. gpt-5.6-terra or claude-opus-5-5."
+    if provider not in {"codex", "claude"} or not provider_model:
+        return f"Unknown model '{requested_model}'. Use a Codex model (gpt-...) or a Claude model (claude-..., opus, sonnet, haiku)."
+    if provider == "codex" and not _CODEX_MODEL_NAME_RE.match(provider_model):
+        return f"Unknown model '{requested_model}'. Use a Codex model (gpt-...) or a Claude model (claude-..., opus, sonnet, haiku)."
+    return None
+
+
+def _claude_model_base(name: str) -> str:
+    base = (name or "").strip().lower()
+    if base.endswith("[1m]"):
+        base = base[: -len("[1m]")]
+    return re.sub(r"-\d{8}$", "", base)
+
+
+async def _guard_claude_substitution(events, requested_model: str | None):
+    """
+    In strict mode, stop a Claude CLI run whose resolved model differs from the versioned model
+    the client asked for (the CLI silently maps retired IDs such as claude-opus-4-1 to a newer
+    model). Aliases like opus/sonnet/haiku resolve to the latest model by design and pass.
+    """
+    async with aclosing(events) as inner:
+        async for evt in inner:
+            if (
+                settings.strict_models
+                and requested_model
+                and requested_model.lower().startswith("claude-")
+                and evt.get("type") == "system"
+                and evt.get("subtype") == "init"
+                and isinstance(evt.get("model"), str)
+                and _claude_model_base(evt["model"]) != _claude_model_base(requested_model)
+            ):
+                raise RuntimeError(
+                    f"[claude-code:model_substituted] Model '{requested_model}' is not available; the "
+                    f"Claude CLI would answer with '{evt['model']}' instead. Request that model explicitly."
+                )
+            yield evt
+
+
 def _parse_provider_model(model: str) -> tuple[str, str | None]:
     raw = (model or "").strip()
     if not raw:
@@ -420,7 +494,7 @@ def _parse_provider_model(model: str) -> tuple[str, str | None]:
     for prefix in ("claude-code:", "claude:"):
         if raw.startswith(prefix):
             inner = raw.split(":", 1)[1].strip()
-            return "claude", (inner or None)
+            return "claude", (_normalize_claude_model_name(inner) or inner or None)
     if raw in {"claude-code", "claude"}:
         return "claude", None
 
@@ -429,6 +503,12 @@ def _parse_provider_model(model: str) -> tuple[str, str | None]:
         return "gemini", (inner or None)
     if raw == "gemini":
         return "gemini", None
+
+    # Anthropic-native names (what Anthropic SDKs and Claude Code send) belong to Claude,
+    # not Codex; otherwise they would silently be answered by a GPT model.
+    claude_model = _normalize_claude_model_name(raw)
+    if claude_model:
+        return "claude", claude_model
 
     return "codex", raw
 
@@ -503,7 +583,10 @@ def _resolve_request_provider(req: ChatCompletionRequest) -> tuple[str, str | No
     )
     client_model = (req.model or "").strip()
     client_model_ignored = bool(forced_provider != "auto" and not settings.allow_client_model_override)
-    requested_model = (fallback_model if client_model_ignored else (client_model or fallback_model)).strip()
+    if settings.strict_models and not client_model_ignored:
+        requested_model = client_model
+    else:
+        requested_model = (fallback_model if client_model_ignored else (client_model or fallback_model)).strip()
     resolved_model = settings.model_aliases.get(requested_model, requested_model)
     parsed_provider, provider_model = _parse_provider_model(resolved_model)
     if settings.allow_client_provider_override or forced_provider == "auto":
@@ -737,6 +820,9 @@ def _extract_upstream_status_code(err: BaseException) -> int | None:
     msg = str(err or "").strip()
     if not msg:
         return None
+    if "unrecognized_model" in msg or "model_substituted" in msg:
+        # Claude CLI rejected the requested model name: a client error, not a gateway failure.
+        return 400
     for rx in (_UPSTREAM_STATUS_RE, _HTTPX_STATUS_RE, _GENERIC_STATUS_RE):
         m = rx.search(msg)
         if m:
@@ -1806,6 +1892,9 @@ async def responses(
         )
 
     provider, provider_model, _requested_model = _resolve_request_provider(chat_req)
+    strict_error = _strict_model_error(_requested_model, provider, provider_model)
+    if strict_error:
+        return _openai_error(strict_error, status_code=400)
     if provider == "codex":
         image_urls = extract_image_urls(chat_req.messages)
         file_inputs = extract_file_inputs(chat_req.messages)
@@ -2006,10 +2095,14 @@ async def anthropic_messages(
             return _anthropic_error("Gateway returned an invalid JSON response", status_code=502)
         if not isinstance(body, dict):
             return _anthropic_error("Gateway returned an invalid response payload", status_code=502)
+        # The converted body has a different size and type, so don't copy those headers over.
+        headers = dict(result.headers)
+        headers.pop("content-length", None)
+        headers.pop("content-type", None)
         return JSONResponse(
             status_code=result.status_code,
             content=openai_chat_completion_to_anthropic_message(body),
-            headers=dict(result.headers),
+            headers=headers,
         )
 
     if isinstance(result, StreamingResponse):
@@ -2054,7 +2147,10 @@ async def chat_completions(
     # If the operator forces a provider and disallows client model override, the client-provided
     # `model` is treated as a compatibility placeholder and ignored for backend selection.
     client_model_ignored = bool(forced_provider != "auto" and not settings.allow_client_model_override)
-    requested_model = (fallback_model if client_model_ignored else (client_model or fallback_model)).strip()
+    if settings.strict_models and not client_model_ignored:
+        requested_model = client_model
+    else:
+        requested_model = (fallback_model if client_model_ignored else (client_model or fallback_model)).strip()
     resolved_model = settings.model_aliases.get(requested_model, requested_model)
     parsed_provider, provider_model = _parse_provider_model(resolved_model)
     if settings.allow_client_provider_override or forced_provider == "auto":
@@ -2065,6 +2161,9 @@ async def chat_completions(
         if not settings.allow_client_model_override:
             # Operator decides the provider model; ignore client-sent model strings.
             provider_model = None
+    strict_error = _strict_model_error(requested_model, provider, provider_model)
+    if strict_error:
+        return _openai_error(strict_error, status_code=400)
     allowed_efforts = {"low", "medium", "high", "xhigh"}
 
     def _normalize_effort(raw: str | None) -> str | None:
@@ -2455,7 +2554,12 @@ async def chat_completions(
                                 result = await _run_codex_once(codex_model)
                             else:
                                 fallback_model = settings.default_model
-                                if codex_model != fallback_model and _looks_like_unsupported_model_error(str(e)):
+                                if (
+                                    settings.codex_model_fallback
+                                    and not settings.strict_models
+                                    and codex_model != fallback_model
+                                    and _looks_like_unsupported_model_error(str(e))
+                                ):
                                     logger.warning(
                                         "[%s] codex model unsupported: %s -> fallback=%s",
                                         resp_id,
@@ -2554,14 +2658,17 @@ async def chat_completions(
 
                             assembler = TextAssembler()
                             fallback_text = None
-                            async for evt in iter_stream_json_events(
-                                cmd=cmd,
-                                env=_claude_cli_env(),
-                                timeout_seconds=settings.timeout_seconds,
-                                stream_limit=settings.subprocess_stream_limit,
-                                event_callback=_evt_log,
-                                stderr_callback=_stderr_log,
-                                cwd=settings.workspace,
+                            async for evt in _guard_claude_substitution(
+                                iter_stream_json_events(
+                                    cmd=cmd,
+                                    env=_claude_cli_env(),
+                                    timeout_seconds=settings.timeout_seconds,
+                                    stream_limit=settings.subprocess_stream_limit,
+                                    event_callback=_evt_log,
+                                    stderr_callback=_stderr_log,
+                                    cwd=settings.workspace,
+                                ),
+                                claude_model,
                             ):
                                 extract_claude_delta(evt, assembler)
                                 maybe_usage = extract_usage_from_claude_result(evt)
@@ -2690,7 +2797,7 @@ async def chat_completions(
                         first_model = provider_model or settings.default_model
                         fallback_model = settings.default_model
                         attempt_models = [first_model]
-                        if first_model != fallback_model:
+                        if settings.codex_model_fallback and not settings.strict_models and first_model != fallback_model:
                             attempt_models.append(fallback_model)
                     else:
                         attempt_models = [provider_model]
@@ -2824,14 +2931,17 @@ async def chat_completions(
                                 events = iter_claude_oauth_events(req=req2, model_name=claude_model)
                             else:
                                 cmd = _claude_cli_cmd(claude_model, prompt)
-                                events = iter_stream_json_events(
-                                    cmd=cmd,
-                                    env=_claude_cli_env(),
-                                    timeout_seconds=settings.timeout_seconds,
-                                    stream_limit=settings.subprocess_stream_limit,
-                                    event_callback=_evt_log,
-                                    stderr_callback=_stderr_log,
-                                    cwd=settings.workspace,
+                                events = _guard_claude_substitution(
+                                    iter_stream_json_events(
+                                        cmd=cmd,
+                                        env=_claude_cli_env(),
+                                        timeout_seconds=settings.timeout_seconds,
+                                        stream_limit=settings.subprocess_stream_limit,
+                                        event_callback=_evt_log,
+                                        stderr_callback=_stderr_log,
+                                        cwd=settings.workspace,
+                                    ),
+                                    claude_model,
                                 )
                         elif provider == "gemini":
                             gemini_model = provider_model or settings.gemini_model or "gemini-3-flash-preview"

@@ -430,6 +430,13 @@ class Settings:
     add_dirs: list[str] = field(default_factory=lambda: _env_csv("CODEX_ADD_DIRS"))
     model_aliases: dict[str, str] = field(default_factory=lambda: _env_json_dict_str_str("CODEX_MODEL_ALIASES"))
     advertised_models: list[str] = field(default_factory=lambda: _env_csv("CODEX_ADVERTISED_MODELS"))
+    # When a requested Codex model is unsupported, retry with CODEX_MODEL instead of failing.
+    # Set CODEX_MODEL_FALLBACK=0 to return the error so clients never get a different model.
+    codex_model_fallback: bool = _env_bool("CODEX_MODEL_FALLBACK", True)
+    # Strict model routing: every request must name a model, each name goes to exactly one
+    # provider (gpt-*/o*/codex-* -> Codex, claude-*/opus/sonnet/haiku -> Claude) and is never
+    # swapped for another model. Unknown or missing names are rejected with HTTP 400.
+    strict_models: bool = _env_bool("CODEX_STRICT_MODELS", False)
     disable_shell_tool: bool = _env_bool("CODEX_DISABLE_SHELL_TOOL", True)
     # Avoid Codex preferring the MCP-based image tool over native vision input.
     disable_view_image_tool: bool = _env_bool("CODEX_DISABLE_VIEW_IMAGE_TOOL", True)

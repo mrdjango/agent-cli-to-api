@@ -199,6 +199,43 @@ class AnthropicRouteTests(unittest.TestCase):
         self.assertEqual(body["type"], "error")
         self.assertEqual(body["error"]["message"], "bad request")
 
+    def test_anthropic_messages_route_sets_content_length_for_converted_body(self) -> None:
+        req = AnthropicMessagesRequest(
+            model="claude-sonnet-4-6",
+            messages=[AnthropicMessage(role="user", content="say ok")],
+        )
+
+        async def fake_chat_completions(chat_req, request, authorization=None):
+            return JSONResponse(
+                content={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "model": "gpt-5.6-terra",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+                    "padding": "x" * 500,
+                },
+                headers={"x-codex-usage": "1"},
+            )
+
+        original = server.chat_completions
+        server.chat_completions = fake_chat_completions
+        authorization = f"Bearer {server.settings.bearer_token}" if server.settings.bearer_token else None
+        try:
+            response = asyncio.run(server.anthropic_messages(req, _request(), authorization))
+        finally:
+            server.chat_completions = original
+
+        self.assertIsInstance(response, JSONResponse)
+        self.assertEqual(int(response.headers["content-length"]), len(response.body))
+        self.assertEqual(response.headers["x-codex-usage"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()
