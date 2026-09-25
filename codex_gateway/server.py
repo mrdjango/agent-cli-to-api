@@ -14,12 +14,14 @@ import time
 import uuid
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Callable
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .codex_cli import collect_codex_text_and_usage_from_events, iter_codex_events
 from .anthropic_compat import (
@@ -31,6 +33,7 @@ from .anthropic_compat import (
     openai_stream_to_anthropic_events,
 )
 from .codex_responses import (
+    add_synthetic_web_search_citations,
     build_codex_headers,
     collect_codex_responses_native_response,
     collect_codex_responses_text_and_usage,
@@ -833,6 +836,256 @@ def _chat_completion_to_responses(chat: dict) -> dict:
     if usage_out is not None:
         resp["usage"] = usage_out
     return resp
+
+
+def _wants_stream_usage(req: ChatCompletionRequest) -> bool:
+    """OpenAI only sends the trailing usage chunk when `stream_options.include_usage` is set."""
+    extra = getattr(req, "model_extra", None) or {}
+    options = extra.get("stream_options") if isinstance(extra, dict) else None
+    return isinstance(options, dict) and options.get("include_usage") is True
+
+
+def _with_stream_usage(req: ChatCompletionRequest) -> ChatCompletionRequest:
+    """Copy of `req` that asks the chat stream for its trailing usage chunk."""
+    stream_options = dict(getattr(req, "stream_options", None) or {})
+    stream_options["include_usage"] = True
+    return req.model_copy(update={"stream_options": stream_options})
+
+
+def _responses_sse_event(payload: dict[str, Any]) -> str:
+    return f"event: {payload.get('type')}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _chat_stream_to_responses_events(
+    chunks: AsyncIterator[bytes | str],
+    *,
+    model: str | None,
+) -> AsyncIterator[str]:
+    """
+    Convert a `/v1/chat/completions` SSE stream into `/v1/responses` SSE events.
+    Keepalive comments are passed through so long-running CLI providers don't time out.
+    """
+    resp_id = f"resp_{uuid.uuid4().hex}"
+    msg_id = f"msg_{uuid.uuid4().hex}"
+    created_at = int(time.time())
+    seq = 0
+
+    def _event(payload: dict[str, Any]) -> str:
+        nonlocal seq
+        payload["sequence_number"] = seq
+        seq += 1
+        return _responses_sse_event(payload)
+
+    def _response_obj(status: str, output: list[dict[str, Any]], usage: dict[str, Any] | None = None) -> dict[str, Any]:
+        obj: dict[str, Any] = {
+            "id": resp_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": status,
+            "model": model,
+            "output": output,
+        }
+        if usage is not None:
+            obj["usage"] = usage
+        return obj
+
+    yield _event({"type": "response.created", "response": _response_obj("in_progress", [])})
+    yield _event({"type": "response.in_progress", "response": _response_obj("in_progress", [])})
+
+    text_parts: list[str] = []
+    message_open = False
+    tool_calls: list[dict[str, Any]] = []
+    tool_calls_by_index: dict[int, dict[str, Any]] = {}
+    usage_out: dict[str, Any] | None = None
+
+    def _handle_chunk(obj: dict[str, Any]) -> list[str]:
+        nonlocal message_open, usage_out
+        out: list[str] = []
+        usage = obj.get("usage")
+        if isinstance(usage, dict):
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+            usage_out = {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "total_tokens": int(usage.get("total_tokens") or (prompt_tokens + completion_tokens)),
+            }
+        choices = obj.get("choices") or []
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        if not isinstance(delta, dict):
+            return out
+
+        text = delta.get("content")
+        if isinstance(text, str) and text:
+            if not message_open:
+                message_open = True
+                out.append(
+                    _event(
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {
+                                "id": msg_id,
+                                "type": "message",
+                                "status": "in_progress",
+                                "role": "assistant",
+                                "content": [],
+                            },
+                        }
+                    )
+                )
+                out.append(
+                    _event(
+                        {
+                            "type": "response.content_part.added",
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": "", "annotations": []},
+                        }
+                    )
+                )
+            text_parts.append(text)
+            out.append(
+                _event(
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": msg_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": text,
+                    }
+                )
+            )
+
+        raw_calls = delta.get("tool_calls")
+        if isinstance(raw_calls, list):
+            for raw in raw_calls:
+                if not isinstance(raw, dict):
+                    continue
+                idx = raw.get("index")
+                slot = tool_calls_by_index.get(idx) if isinstance(idx, int) else None
+                if slot is None:
+                    slot = {"id": None, "name": "", "arguments": ""}
+                    tool_calls.append(slot)
+                    if isinstance(idx, int):
+                        tool_calls_by_index[idx] = slot
+                if isinstance(raw.get("id"), str) and raw["id"]:
+                    slot["id"] = raw["id"]
+                fn = raw.get("function")
+                if isinstance(fn, dict):
+                    if isinstance(fn.get("name"), str) and fn["name"]:
+                        slot["name"] = fn["name"]
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        slot["arguments"] += args
+                    elif args is not None:
+                        slot["arguments"] += json.dumps(args, ensure_ascii=False)
+        return out
+
+    buffer = ""
+    async for chunk in chunks:
+        buffer += chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else chunk
+        while "\n\n" in buffer:
+            raw_event, buffer = buffer.split("\n\n", 1)
+            lines = raw_event.splitlines()
+            data_lines = [line[len("data:") :].lstrip() for line in lines if line.startswith("data:")]
+            if not data_lines:
+                if any(line.startswith(":") for line in lines):
+                    yield ": ping\n\n"
+                continue
+            data = "\n".join(data_lines).strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                for evt in _handle_chunk(obj):
+                    yield evt
+
+    output: list[dict[str, Any]] = []
+    if message_open:
+        full_text = "".join(text_parts)
+        part = {"type": "output_text", "text": full_text, "annotations": []}
+        yield _event(
+            {
+                "type": "response.output_text.done",
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": full_text,
+            }
+        )
+        yield _event(
+            {
+                "type": "response.content_part.done",
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": part,
+            }
+        )
+        message_item = {
+            "id": msg_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [part],
+        }
+        yield _event({"type": "response.output_item.done", "output_index": 0, "item": message_item})
+        output.append(message_item)
+
+    for call in tool_calls:
+        output_index = len(output)
+        item_id = f"fc_{uuid.uuid4().hex}"
+        call_id = call["id"] or f"call_{uuid.uuid4().hex}"
+        arguments = call["arguments"]
+        yield _event(
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": call["name"],
+                    "arguments": "",
+                },
+            }
+        )
+        if arguments:
+            yield _event(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "delta": arguments,
+                }
+            )
+        yield _event(
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "arguments": arguments,
+            }
+        )
+        call_item = {
+            "id": item_id,
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": call["name"],
+            "arguments": arguments,
+        }
+        yield _event({"type": "response.output_item.done", "output_index": output_index, "item": call_item})
+        output.append(call_item)
+
+    yield _event({"type": "response.completed", "response": _response_obj("completed", output, usage_out)})
 
 
 _UPSTREAM_STATUS_RE = re.compile(r"(?:\bAPI Error:\s*|\bfailed:\s*)(\d{3})\b")
@@ -1901,6 +2154,191 @@ async def embeddings(
     return JSONResponse(status_code=resp.status_code, content=body)
 
 
+_NATIVE_STREAM_DONE = object()
+
+
+def _is_codex_auth_error(err: BaseException) -> bool:
+    msg = str(err)
+    return "codex responses failed: 401" in msg or "codex responses failed: 403" in msg
+
+
+async def _stream_native_codex_responses(
+    *,
+    resp_id: str,
+    open_events: Callable[[], AsyncIterator[dict[str, Any]]],
+    response_headers: dict[str, str],
+    t0: float,
+) -> JSONResponse | StreamingResponse:
+    """
+    Pass the Codex backend `/responses` SSE stream through to the client as-is.
+
+    The first upstream event is awaited before returning, so upstream failures (auth, bad model,
+    rate limits) surface as a real HTTP error status instead of a 200 stream that errors mid-way.
+    """
+    global _active_requests
+    sem = _get_semaphore()
+    await sem.acquire()
+    pump_task: asyncio.Task | None = None
+    cleaned_up = False
+
+    def _cleanup() -> None:
+        # Idempotent: runs from the stream's finally, and again as a background task in case the
+        # client disconnected before the stream body was ever iterated.
+        global _active_requests
+        nonlocal cleaned_up
+        if cleaned_up:
+            return
+        cleaned_up = True
+        if pump_task is not None:
+            pump_task.cancel()
+        sem.release()
+        _active_requests -= 1
+
+    def _start_pump() -> tuple[asyncio.Queue, asyncio.Task]:
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def _pump() -> None:
+            try:
+                async for evt in open_events():
+                    queue.put_nowait(evt)
+            except Exception as e:
+                queue.put_nowait(e)
+            finally:
+                queue.put_nowait(_NATIVE_STREAM_DONE)
+
+        return queue, asyncio.create_task(_pump())
+
+    try:
+        queue, pump_task = _start_pump()
+        first = await queue.get()
+        if isinstance(first, Exception) and _is_codex_auth_error(first):
+            pump_task.cancel()
+            await maybe_refresh_codex_auth(
+                codex_cli_home=settings.codex_cli_home,
+                timeout_seconds=min(settings.timeout_seconds, 30),
+            )
+            queue, pump_task = _start_pump()
+            first = await queue.get()
+        if isinstance(first, Exception):
+            raise first
+        if first is _NATIVE_STREAM_DONE:
+            raise RuntimeError("codex responses failed: upstream returned an empty stream")
+    except Exception as e:
+        _cleanup()
+        _request_stats.record_failure()
+        status = _extract_upstream_status_code(e) or 502
+        _print_error_panel(resp_id, str(e), status_code=status)
+        return _openai_error(str(e), status_code=status)
+
+    async def native_sse_gen() -> AsyncIterator[str]:
+        outcome = "aborted"
+        usage: dict[str, object] | None = None
+        text_chunks: list[str] = []
+        output_items: dict[int, dict[str, Any]] = {}
+        last_seq = -1
+        keepalive = max(settings.sse_keepalive_seconds, 0)
+        pending: object = first
+
+        def _error_event(message: str, code: str) -> str:
+            return _responses_sse_event(
+                {
+                    "type": "error",
+                    "code": code,
+                    "message": message,
+                    "param": None,
+                    "sequence_number": last_seq + 1,
+                }
+            )
+
+        try:
+            while True:
+                if pending is not None:
+                    evt, pending = pending, None
+                else:
+                    try:
+                        if keepalive > 0:
+                            evt = await asyncio.wait_for(queue.get(), timeout=keepalive)
+                        else:
+                            evt = await queue.get()
+                    except (asyncio.TimeoutError, TimeoutError):
+                        yield ": ping\n\n"
+                        continue
+
+                if evt is _NATIVE_STREAM_DONE:
+                    if outcome == "aborted":
+                        outcome = "error"
+                        yield _error_event("codex responses stream ended before response.completed", "upstream_incomplete")
+                    break
+                if isinstance(evt, Exception):
+                    outcome = "error"
+                    _print_error_panel(resp_id, str(evt), status_code=_extract_upstream_status_code(evt) or 502)
+                    yield _error_event(str(evt), "upstream_error")
+                    break
+                if not isinstance(evt, dict):
+                    continue
+
+                t = evt.get("type")
+                if isinstance(evt.get("sequence_number"), int):
+                    last_seq = evt["sequence_number"]
+                if t == "keepalive":
+                    continue
+                if t == "gateway.upstream_incomplete":
+                    outcome = "error"
+                    yield _error_event(str(evt.get("message") or "codex responses stream ended early"), "upstream_incomplete")
+                    break
+
+                if t in {"response.output_item.added", "response.output_item.done"}:
+                    item = evt.get("item")
+                    output_index = evt.get("output_index")
+                    if isinstance(item, dict) and isinstance(output_index, int):
+                        output_items[output_index] = item
+                elif t == "response.output_text.delta" and isinstance(evt.get("delta"), str):
+                    text_chunks.append(evt["delta"])
+                elif t == "response.completed":
+                    response = evt.get("response")
+                    if isinstance(response, dict):
+                        if output_items:
+                            response["output"] = [output_items[index] for index in sorted(output_items)]
+                        response.setdefault("object", "response")
+                        add_synthetic_web_search_citations(response)
+                        usage = _codex_response_usage_for_openai(response)
+                    outcome = "ok"
+                elif t in {"response.failed", "error"}:
+                    outcome = "error"
+
+                yield _responses_sse_event(evt)
+                if t in {"response.completed", "response.incomplete", "response.failed", "error"}:
+                    if t == "response.incomplete":
+                        outcome = "ok"
+                    break
+        finally:
+            _cleanup()
+            duration_ms = int((time.time() - t0) * 1000)
+            text = _maybe_strip_answer_tags("".join(text_chunks)).strip()
+            if outcome == "ok":
+                _request_stats.record_success(duration_ms, usage)  # type: ignore[arg-type]
+                usage_str = f" usage={usage}" if isinstance(usage, dict) else ""
+                if settings.effective_log_mode() == "full" and text:
+                    if not _maybe_print_markdown(resp_id, "RESPONSE", text, duration_ms=duration_ms, usage=usage):  # type: ignore[arg-type]
+                        logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
+                        logger.info("[%s] RESPONSE:\n%s", resp_id, _truncate_for_log(text))
+                else:
+                    logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
+            else:
+                _request_stats.record_failure()
+                logger.warning(
+                    "[%s] stream ended status=%s duration_ms=%d chars=%d", resp_id, outcome, duration_ms, len(text)
+                )
+            _maybe_print_stats()
+
+    return StreamingResponse(
+        native_sse_gen(),
+        media_type="text/event-stream",
+        headers=response_headers or None,
+        background=BackgroundTask(_cleanup),
+    )
+
+
 @app.post("/v1/responses")
 @app.post("/responses")
 async def responses(
@@ -1913,11 +2351,6 @@ async def responses(
     chat_req = responses_request_to_chat_request(req)
     if not chat_req.messages:
         return _openai_error("Missing input for responses request", status_code=422)
-    if chat_req.stream:
-        return _openai_error(
-            "Streaming responses are not supported; set stream=false or use /v1/chat/completions",
-            status_code=400,
-        )
 
     provider, provider_model, _requested_model = _resolve_request_provider(chat_req)
     strict_error = _strict_model_error(_requested_model, provider, provider_model)
@@ -1957,7 +2390,12 @@ async def responses(
             if settings.log_render_markdown:
                 _print_separator(resp_id, "codex/codex-responses", model=codex_model)
             else:
-                logger.info("[%s] ▶ model=%s provider=codex mode=codex-responses stream=false", resp_id, codex_model)
+                logger.info(
+                    "[%s] ▶ model=%s provider=codex mode=codex-responses stream=%s",
+                    resp_id,
+                    codex_model,
+                    str(chat_req.stream).lower(),
+                )
             if settings.debug_log:
                 logger.info("[%s] provider_model effective=%s (client=%s)", resp_id, codex_model, provider_model or "<none>")
             req_meta_md, req_meta_plain = _format_request_metadata(
@@ -1978,7 +2416,7 @@ async def responses(
                     url=str(request.url),
                     authorization=authorization,
                     payload=req.model_dump(exclude_none=True, mode="json"),
-                    stream=False,
+                    stream=chat_req.stream,
                 )
                 if settings.log_render_markdown:
                     _maybe_print_markdown(resp_id, "CURL", f"```bash\n{curl_cmd}\n```")
@@ -1987,7 +2425,7 @@ async def responses(
             if settings.effective_log_mode() == "full":
                 logger.info("[%s] PROMPT:\n%s", resp_id, _truncate_for_log(prompt))
 
-            async def _run_native_responses_once() -> dict:
+            def _open_native_events() -> AsyncIterator[dict[str, Any]]:
                 auth = load_codex_auth(codex_cli_home=settings.codex_cli_home)
                 token = auth.api_key or auth.access_token
                 if not token:
@@ -2026,7 +2464,18 @@ async def responses(
                     event_callback=lambda evt: _log_codex_responses_event(resp_id, evt),
                     response_headers_cb=_capture_headers,
                 )
-                return await collect_codex_responses_native_response(events)
+                return events
+
+            async def _run_native_responses_once() -> dict:
+                return await collect_codex_responses_native_response(_open_native_events())
+
+            if chat_req.stream:
+                return await _stream_native_codex_responses(
+                    resp_id=resp_id,
+                    open_events=_open_native_events,
+                    response_headers=response_headers,
+                    t0=t0,
+                )
 
             try:
                 async with _get_semaphore():
@@ -2066,9 +2515,21 @@ async def responses(
                 logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
             return JSONResponse(content=native_response, headers=response_headers)
 
+    if chat_req.stream:
+        # `response.completed` carries usage, so ask the chat stream for its trailing usage chunk.
+        chat_req = _with_stream_usage(chat_req)
     result = await chat_completions(chat_req, request, authorization)
-    if isinstance(result, (JSONResponse, StreamingResponse)):
-        if isinstance(result, JSONResponse) and result.status_code < 400:
+    if isinstance(result, StreamingResponse):
+        stream_headers = dict(result.headers)
+        stream_headers.pop("content-length", None)
+        stream_headers.pop("content-type", None)
+        return StreamingResponse(
+            _chat_stream_to_responses_events(result.body_iterator, model=req.model),
+            media_type="text/event-stream",
+            headers=stream_headers,
+        )
+    if isinstance(result, JSONResponse):
+        if result.status_code < 400:
             try:
                 body = json.loads(result.body.decode("utf-8"))
             except Exception:
@@ -2107,6 +2568,8 @@ async def anthropic_messages(
         return _anthropic_error("Missing messages for messages request", status_code=422)
 
     chat_req = anthropic_messages_to_chat_request(req)
+    if chat_req.stream:
+        chat_req = _with_stream_usage(chat_req)
     result = await chat_completions(chat_req, request, authorization)
 
     if isinstance(result, JSONResponse):
@@ -3156,10 +3619,14 @@ async def chat_completions(
                                                 evt.get("session_id"),
                                             )
                                     delta = _maybe_strip_answer_tags(extract_cursor_agent_delta(evt, assembler))
+                                    # cursor-agent mirrors Claude's stream-json; newer versions report usage on `result`.
+                                    stream_usage = extract_usage_from_claude_result(evt) or stream_usage
                                 elif provider == "claude":
                                     delta = _maybe_strip_answer_tags(extract_claude_delta(evt, assembler))
+                                    stream_usage = extract_usage_from_claude_result(evt) or stream_usage
                                 elif provider == "gemini":
                                     delta = _maybe_strip_answer_tags(extract_gemini_delta(evt, assembler))
+                                    stream_usage = extract_usage_from_gemini_result(evt) or stream_usage
 
                                 if delta:
                                     sent_content = True
@@ -3208,6 +3675,16 @@ async def chat_completions(
                         }
                         yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
                     yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n"
+                    if stream_usage is not None and _wants_stream_usage(req):
+                        usage_chunk = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": requested_model,
+                            "choices": [],
+                            "usage": stream_usage,
+                        }
+                        yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     if stream_outcome == "aborted":
                         stream_outcome = "ok"

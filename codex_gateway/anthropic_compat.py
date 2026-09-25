@@ -394,6 +394,7 @@ async def openai_stream_to_anthropic_events(
     text_block_open = False
     next_index = 0
     stop_reason = "end_turn"
+    usage: dict[str, int] = {"output_tokens": 0}
 
     yield _anthropic_sse_event(
         "message_start",
@@ -422,6 +423,14 @@ async def openai_stream_to_anthropic_events(
 
         if not isinstance(obj, dict):
             continue
+        # Trailing `stream_options.include_usage` chunk: usage is only known once generation ends,
+        # so it's reported on `message_delta` (which Anthropic allows to carry input tokens too).
+        chunk_usage = obj.get("usage")
+        if isinstance(chunk_usage, dict):
+            usage = {
+                "input_tokens": int(chunk_usage.get("prompt_tokens") or 0),
+                "output_tokens": int(chunk_usage.get("completion_tokens") or 0),
+            }
         choices = obj.get("choices") or []
         choice = choices[0] if isinstance(choices, list) and choices else {}
         if not isinstance(choice, dict):
@@ -493,7 +502,7 @@ async def openai_stream_to_anthropic_events(
         {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": 0},
+            "usage": usage,
         },
     )
     yield _anthropic_sse_event("message_stop", {"type": "message_stop"})

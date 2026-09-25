@@ -136,6 +136,20 @@ class AnthropicCompatTests(unittest.TestCase):
         self.assertIn('"stop_reason": "end_turn"', joined)
         self.assertIn("event: message_stop", joined)
 
+    def test_openai_stream_to_anthropic_events_reports_trailing_usage(self) -> None:
+        async def source():
+            yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+            yield 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            yield 'data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}\n\n'
+            yield "data: [DONE]\n\n"
+
+        async def collect():
+            return [event async for event in openai_stream_to_anthropic_events(source(), model="claude-sonnet-4-6")]
+
+        message_delta = next(e for e in asyncio.run(collect()) if e.startswith("event: message_delta"))
+        payload = json.loads(message_delta.split("data: ", 1)[1])
+        self.assertEqual(payload["usage"], {"input_tokens": 12, "output_tokens": 3})
+
 
 class AnthropicRouteTests(unittest.TestCase):
     def test_anthropic_messages_route_wraps_existing_chat_flow(self) -> None:
