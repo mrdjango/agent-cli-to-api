@@ -251,6 +251,25 @@ def extract_codex_tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
     return tool_calls
 
 
+def remember_codex_output_item(evt: dict[str, Any], output_items: dict[int, dict[str, Any]]) -> None:
+    """Keep finished output items; `response.completed` can arrive with an empty `output` list."""
+    if evt.get("type") != "response.output_item.done":
+        return
+    item = evt.get("item")
+    output_index = evt.get("output_index")
+    if isinstance(item, dict) and isinstance(output_index, int):
+        output_items[output_index] = item
+
+
+def extract_codex_tool_calls_from_completed(
+    response: dict[str, Any], output_items: dict[int, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    tool_calls = extract_codex_tool_calls(response)
+    if tool_calls or not output_items:
+        return tool_calls
+    return extract_codex_tool_calls({"output": [output_items[index] for index in sorted(output_items)]})
+
+
 def _prompt_dir() -> Path:
     return Path(__file__).with_name("codex_instructions")
 
@@ -710,10 +729,12 @@ async def collect_codex_responses_text_and_usage(
     usage: dict[str, Any] | None = None
     tool_calls: list[dict[str, Any]] | None = None
     images: list[dict[str, Any]] = []
+    output_items: dict[int, dict[str, Any]] = {}
     incomplete_message: str | None = None
 
     async for evt in events:
         t = evt.get("type")
+        remember_codex_output_item(evt, output_items)
         if t == "gateway.upstream_incomplete":
             msg = evt.get("message")
             incomplete_message = msg if isinstance(msg, str) and msg else "codex responses stream ended before completion"
@@ -756,7 +777,7 @@ async def collect_codex_responses_text_and_usage(
                     "completion_tokens_details": u.get("output_tokens_details") if isinstance(u.get("output_tokens_details"), dict) else {},
                 }
             if isinstance(resp, dict):
-                parsed = extract_codex_tool_calls(resp)
+                parsed = extract_codex_tool_calls_from_completed(resp, output_items)
                 if parsed:
                     tool_calls = parsed
             break

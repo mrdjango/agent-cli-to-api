@@ -40,10 +40,11 @@ from .codex_responses import (
     collect_codex_responses_text_and_usage,
     convert_chat_completions_to_codex_responses,
     extract_codex_usage_headers,
-    extract_codex_tool_calls,
+    extract_codex_tool_calls_from_completed,
     iter_codex_responses_events,
     load_codex_auth,
     maybe_refresh_codex_auth,
+    remember_codex_output_item,
     warmup_codex_auth,
 )
 from .config import DEFAULT_CODEX_ADVERTISED_MODELS, settings
@@ -3156,13 +3157,10 @@ async def chat_completions(
                                     settings.claude_oauth_creds_path,
                                 )
                             msgs = _maybe_inject_automation_guard_messages(req.messages)
-                            req2 = ChatCompletionRequest(
-                                model=req.model,
-                                messages=msgs,
-                                stream=req.stream,
-                                max_tokens=req.max_tokens,
-                            )
-                            text, usage = await claude_oauth_generate(req=req2, model_name=claude_model)
+                            # Keep client extras (tools, tool_choice, parallel_tool_calls) for the Messages API.
+                            req2 = req.model_copy(update={"messages": msgs})
+                            text, usage, claude_tool_calls = await claude_oauth_generate(req=req2, model_name=claude_model)
+                            tool_calls = claude_tool_calls or None
                         else:
                             cmd = _claude_cli_cmd(claude_model, prompt, claude_effort)
 
@@ -3289,6 +3287,7 @@ async def chat_completions(
             assembled_text = ""
             stream_usage: dict[str, object] | None = None
             stream_tool_calls: list[dict[str, object]] | None = None
+            stream_output_items: dict[int, dict[str, object]] = {}
             # "aborted" unless the stream reaches [DONE]; covers crashes and closed connections.
             stream_outcome = "aborted"
             try:
@@ -3433,12 +3432,8 @@ async def chat_completions(
                                         settings.claude_oauth_creds_path,
                                     )
                                 msgs = _maybe_inject_automation_guard_messages(req.messages)
-                                req2 = ChatCompletionRequest(
-                                    model=req.model,
-                                    messages=msgs,
-                                    stream=req.stream,
-                                    max_tokens=req.max_tokens,
-                                )
+                                # Keep client extras (tools, tool_choice, parallel_tool_calls) for the Messages API.
+                                req2 = req.model_copy(update={"messages": msgs})
                                 events = iter_claude_oauth_events(req=req2, model_name=claude_model)
                             else:
                                 cmd = _claude_cli_cmd(claude_model, prompt, claude_effort)
@@ -3567,6 +3562,7 @@ async def chat_completions(
                                 delta = ""
                                 if provider == "codex":
                                     if use_codex_backend:
+                                        remember_codex_output_item(evt, stream_output_items)
                                         if evt.get("type") == "response.output_text.delta" and isinstance(
                                             evt.get("delta"), str
                                         ):
@@ -3597,7 +3593,7 @@ async def chat_completions(
                                                     else {},
                                                 }
                                             if isinstance(resp, dict):
-                                                parsed_calls = extract_codex_tool_calls(resp)
+                                                parsed_calls = extract_codex_tool_calls_from_completed(resp, stream_output_items)
                                                 if parsed_calls:
                                                     stream_tool_calls = parsed_calls
                                             break
@@ -3628,6 +3624,9 @@ async def chat_completions(
                                     # cursor-agent mirrors Claude's stream-json; newer versions report usage on `result`.
                                     stream_usage = extract_usage_from_claude_result(evt) or stream_usage
                                 elif provider == "claude":
+                                    if evt.get("type") == "gateway.tool_calls":
+                                        stream_tool_calls = evt.get("tool_calls") or None
+                                        continue
                                     delta = _maybe_strip_answer_tags(extract_claude_delta(evt, assembler))
                                     stream_usage = extract_usage_from_claude_result(evt) or stream_usage
                                 elif provider == "gemini":
@@ -3677,7 +3676,18 @@ async def chat_completions(
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": requested_model,
-                            "choices": [{"index": 0, "delta": {"tool_calls": stream_tool_calls}, "finish_reason": None}],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    # Streamed tool call deltas must carry `index` (OpenAI chunk format).
+                                    "delta": {
+                                        "tool_calls": [
+                                            {"index": i, **call} for i, call in enumerate(stream_tool_calls)
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
                         yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
                     yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n"

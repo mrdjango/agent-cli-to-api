@@ -5,6 +5,7 @@ import json
 import logging
 import mimetypes
 import time
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -312,18 +313,17 @@ def _openai_messages_to_anthropic(req: ChatCompletionRequest) -> tuple[str | Non
             if not isinstance(tool_call_id, str) or not tool_call_id:
                 continue
             content = normalize_message_content(getattr(msg, "content", None))
-            out.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id,
-                            "content": content,
-                        }
-                    ],
-                }
-            )
+            result_block = {"type": "tool_result", "tool_use_id": tool_call_id, "content": content}
+            # Results of parallel tool calls belong in a single user turn.
+            prev = out[-1] if out else None
+            if (
+                prev
+                and prev["role"] == "user"
+                and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in prev["content"])
+            ):
+                prev["content"].append(result_block)
+            else:
+                out.append({"role": "user", "content": [result_block]})
             continue
 
         if role not in {"user", "assistant"}:
@@ -408,7 +408,7 @@ def _openai_tool_choice_to_anthropic(choice: Any) -> dict[str, Any] | None:
         if lowered in {"required", "any"}:
             return {"type": "any"}
         if lowered == "none":
-            return None
+            return {"type": "none"}
         return None
     if isinstance(choice, dict):
         ctype = choice.get("type")
@@ -424,16 +424,37 @@ def _apply_openai_tools(payload: dict[str, Any], req: ChatCompletionRequest) -> 
     if not isinstance(extra, dict):
         return
     tools = extra.get("tools")
-    tool_choice = extra.get("tool_choice")
-    if tool_choice == "none":
+    if not isinstance(tools, list) or not tools:
         return
-    if isinstance(tools, list) and tools:
-        converted = _openai_tools_to_anthropic(tools)
-        if converted:
-            payload["tools"] = converted
-    mapped_choice = _openai_tool_choice_to_anthropic(tool_choice)
+    converted = _openai_tools_to_anthropic(tools)
+    if not converted:
+        return
+    payload["tools"] = converted
+    mapped_choice = _openai_tool_choice_to_anthropic(extra.get("tool_choice"))
+    if extra.get("parallel_tool_calls") is False and (mapped_choice or {}).get("type") != "none":
+        mapped_choice = {**(mapped_choice or {"type": "auto"}), "disable_parallel_tool_use": True}
     if mapped_choice is not None:
         payload["tool_choice"] = mapped_choice
+
+
+def _anthropic_tool_use_to_openai(block_id: Any, name: Any, arguments: Any) -> dict[str, Any]:
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+    return {
+        "id": block_id if isinstance(block_id, str) and block_id else f"toolu_{uuid.uuid4().hex}",
+        "type": "function",
+        "function": {"name": name if isinstance(name, str) and name else "tool", "arguments": arguments or "{}"},
+    }
+
+
+def _extract_tool_calls_from_anthropic_response(data: Any) -> list[dict[str, Any]]:
+    if not isinstance(data, dict) or not isinstance(data.get("content"), list):
+        return []
+    return [
+        _anthropic_tool_use_to_openai(item.get("id"), item.get("name"), item.get("input"))
+        for item in data["content"]
+        if isinstance(item, dict) and item.get("type") == "tool_use"
+    ]
 
 
 def _extract_text_from_anthropic_response(data: Any) -> str:
@@ -491,7 +512,7 @@ async def generate_oauth(
     *,
     req: ChatCompletionRequest,
     model_name: str,
-) -> tuple[str, dict[str, int] | None]:
+) -> tuple[str, dict[str, int] | None, list[dict[str, Any]]]:
     t0 = time.time()
     
     # Try CLI config first, then OAuth creds
@@ -564,7 +585,11 @@ async def generate_oauth(
         resp.status_code, api_latency_ms,
     )
 
-    return _extract_text_from_anthropic_response(data), _extract_usage_from_anthropic_response(data)
+    return (
+        _extract_text_from_anthropic_response(data),
+        _extract_usage_from_anthropic_response(data),
+        _extract_tool_calls_from_anthropic_response(data),
+    )
 
 
 async def _iter_sse_events(resp: httpx.Response) -> AsyncIterator[tuple[str | None, str]]:
@@ -761,6 +786,8 @@ async def iter_oauth_stream_events(
     url = f"{base_url.rstrip('/')}/v1/messages"
 
     usage: dict[str, int] | None = None
+    # tool_use blocks by content index: [id, name, partial_json chunks, input from content_block_start]
+    tool_blocks: dict[int, list[Any]] = {}
     client = await get_async_client("claude-stream")
     async with client.stream("POST", url, json=payload, headers=headers, timeout=settings.timeout_seconds) as resp:
         try:
@@ -775,6 +802,21 @@ async def iter_oauth_stream_events(
                     obj = json.loads(data)
                 except Exception:
                     continue
+                if isinstance(obj, dict) and isinstance(obj.get("index"), int):
+                    block = obj.get("content_block")
+                    if obj.get("type") == "content_block_start" and isinstance(block, dict):
+                        if block.get("type") == "tool_use":
+                            tool_blocks[obj["index"]] = [block.get("id"), block.get("name"), [], block.get("input")]
+                        continue
+                    json_delta = obj.get("delta")
+                    if (
+                        obj.get("type") == "content_block_delta"
+                        and isinstance(json_delta, dict)
+                        and json_delta.get("type") == "input_json_delta"
+                    ):
+                        if obj["index"] in tool_blocks and isinstance(json_delta.get("partial_json"), str):
+                            tool_blocks[obj["index"]][2].append(json_delta["partial_json"])
+                        continue
                 delta = _extract_delta_text(obj)
                 if delta:
                     yield {
@@ -785,5 +827,13 @@ async def iter_oauth_stream_events(
                 if maybe_usage:
                     usage = maybe_usage
 
+    if tool_blocks:
+        yield {
+            "type": "gateway.tool_calls",
+            "tool_calls": [
+                _anthropic_tool_use_to_openai(block_id, name, "".join(parts) if parts else start_input)
+                for block_id, name, parts, start_input in (tool_blocks[i] for i in sorted(tool_blocks))
+            ],
+        }
     if usage:
         yield {"type": "result", "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]}}
