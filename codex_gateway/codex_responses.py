@@ -282,10 +282,27 @@ def _convert_openai_tool_for_codex(tool: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _is_web_search_tool(tool: Any) -> bool:
+    # Covers OpenAI `web_search` / `web_search_preview*` and Anthropic `web_search_2025*`.
+    return isinstance(tool, dict) and str(tool.get("type") or "").startswith("web_search")
+
+
+def client_requested_web_search(req: ChatCompletionRequest) -> bool:
+    """True when the client asked for web search: a web_search tool or `web_search_options`."""
+    extra = getattr(req, "model_extra", None) or {}
+    if not isinstance(extra, dict):
+        return False
+    if extra.get("web_search_options") is not None:
+        return True
+    tools = extra.get("tools")
+    return isinstance(tools, list) and any(_is_web_search_tool(tool) for tool in tools)
+
+
 def _convert_openai_tools_for_codex(tools: list[Any]) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for tool in tools:
-        if not isinstance(tool, dict):
+        # Client web_search tools are replaced by the gateway's own when search is enabled.
+        if not isinstance(tool, dict) or _is_web_search_tool(tool):
             continue
         converted.append(_convert_openai_tool_for_codex(tool))
     return converted

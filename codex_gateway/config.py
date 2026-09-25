@@ -421,6 +421,8 @@ class Settings:
     sandbox: SandboxMode = os.environ.get("CODEX_SANDBOX", "read-only")  # type: ignore[assignment]
     approval_policy: ApprovalPolicy = os.environ.get("CODEX_APPROVAL_POLICY", "never")  # type: ignore[assignment]
     skip_git_repo_check: bool = _env_bool("CODEX_SKIP_GIT_REPO_CHECK", True)
+    # Allow web search for requests that ask for it (a web_search tool or web_search_options).
+    # Search is never added to requests that don't ask. Set CODEX_ENABLE_SEARCH=0 to refuse it.
     enable_search: bool = _env_bool("CODEX_ENABLE_SEARCH", True)
     # NOTE: defaulted to False because injecting the image_generation tool into
     # every chat completion lets the model decide to draw a picture for prompts

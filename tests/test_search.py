@@ -1,14 +1,16 @@
 import asyncio
 import unittest
 
+from codex_gateway.anthropic_compat import AnthropicMessagesRequest, anthropic_messages_to_chat_request
 from codex_gateway.codex_responses import (
+    client_requested_web_search,
     collect_codex_responses_native_response,
     collect_codex_responses_text_and_usage,
     convert_chat_completions_to_codex_responses,
 )
 from codex_gateway.config import Settings
 from codex_gateway.openai_compat import ChatCompletionRequest, ChatMessage, responses_input_to_messages
-from codex_gateway.server import _should_use_codex_backend
+from codex_gateway.server import _search_enabled_for, _should_use_codex_backend, settings
 
 
 class SearchTests(unittest.TestCase):
@@ -29,6 +31,104 @@ class SearchTests(unittest.TestCase):
         self.assertIn({"type": "web_search", "external_web_access": True}, payload["tools"])
         self.assertNotEqual(payload.get("tool_choice"), "none")
         self.assertIn("Sources section", payload["input"][0]["content"][0]["text"])
+
+    def test_search_is_not_requested_by_plain_messages(self) -> None:
+        req = ChatCompletionRequest(model="gpt-5.5", messages=[ChatMessage(role="user", content="hi")])
+
+        self.assertFalse(client_requested_web_search(req))
+        self.assertFalse(_search_enabled_for(req))
+
+    def test_plain_request_payload_has_no_search_tool_or_hint(self) -> None:
+        req = ChatCompletionRequest(model="gpt-5.5", messages=[ChatMessage(role="user", content="hi")])
+        payload = convert_chat_completions_to_codex_responses(
+            req,
+            model_name="gpt-5.5",
+            force_stream=True,
+            allow_tools=True,
+            enable_search=_search_enabled_for(req),
+        )
+
+        self.assertEqual(payload["tools"], [])
+        self.assertEqual(len(payload["input"]), 1)
+        self.assertNotIn("Sources section", str(payload["input"]))
+
+    def test_client_web_search_tools_request_search(self) -> None:
+        for tool in (
+            {"type": "web_search"},
+            {"type": "web_search_preview", "search_context_size": "low"},
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+        ):
+            with self.subTest(tool=tool):
+                req = ChatCompletionRequest(
+                    model="gpt-5.5",
+                    messages=[ChatMessage(role="user", content="news?")],
+                    tools=[tool],
+                )
+                self.assertTrue(_search_enabled_for(req))
+
+    def test_web_search_options_requests_search(self) -> None:
+        req = ChatCompletionRequest(
+            model="gpt-5.5",
+            messages=[ChatMessage(role="user", content="news?")],
+            web_search_options={},
+        )
+
+        self.assertTrue(_search_enabled_for(req))
+
+    def test_client_search_tool_is_normalized_and_kept_beside_functions(self) -> None:
+        func = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+        req = ChatCompletionRequest(
+            model="gpt-5.5",
+            messages=[ChatMessage(role="user", content="news?")],
+            tools=[func, {"type": "web_search_preview"}],
+        )
+        payload = convert_chat_completions_to_codex_responses(
+            req,
+            model_name="gpt-5.5",
+            force_stream=True,
+            allow_tools=True,
+            enable_search=_search_enabled_for(req),
+        )
+
+        self.assertEqual(
+            payload["tools"],
+            [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                {"type": "web_search", "external_web_access": True},
+            ],
+        )
+
+    def test_operator_can_refuse_search_even_when_client_asks(self) -> None:
+        req = ChatCompletionRequest(
+            model="gpt-5.5",
+            messages=[ChatMessage(role="user", content="news?")],
+            tools=[{"type": "web_search"}],
+        )
+        original = settings.enable_search
+        object.__setattr__(settings, "enable_search", False)
+        try:
+            enabled = _search_enabled_for(req)
+        finally:
+            object.__setattr__(settings, "enable_search", original)
+        payload = convert_chat_completions_to_codex_responses(
+            req, model_name="gpt-5.5", force_stream=True, allow_tools=True, enable_search=enabled
+        )
+
+        self.assertFalse(enabled)
+        self.assertEqual(payload["tools"], [])
+
+    def test_anthropic_web_search_tool_becomes_search_request(self) -> None:
+        chat_req = anthropic_messages_to_chat_request(
+            AnthropicMessagesRequest(
+                model="gpt-5.5",
+                max_tokens=100,
+                messages=[{"role": "user", "content": "news?"}],
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            )
+        )
+
+        self.assertEqual(chat_req.model_extra["tools"], [{"type": "web_search"}])
+        self.assertTrue(client_requested_web_search(chat_req))
 
     def test_search_keeps_codex_backend_available(self) -> None:
         self.assertTrue(

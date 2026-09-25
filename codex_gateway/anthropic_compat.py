@@ -233,8 +233,15 @@ def anthropic_messages_to_chat_request(req: AnthropicMessagesRequest | Anthropic
                 },
             }
             for tool in tools
-            if isinstance(tool, dict) and isinstance(tool.get("name"), str) and tool["name"].strip()
+            if isinstance(tool, dict)
+            and isinstance(tool.get("name"), str)
+            and tool["name"].strip()
+            and not str(tool.get("type") or "").startswith("web_search")
         ]
+        # Anthropic's server-side web search tool (e.g. web_search_20250305) is a search opt-in,
+        # not a client function.
+        if any(isinstance(tool, dict) and str(tool.get("type") or "").startswith("web_search") for tool in tools):
+            extra["tools"].append({"type": "web_search"})
         extra["tools"] = [tool for tool in extra["tools"] if isinstance(tool, dict)]
     tool_choice = getattr(req, "tool_choice", None)
     if isinstance(tool_choice, dict):

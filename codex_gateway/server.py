@@ -35,6 +35,7 @@ from .anthropic_compat import (
 from .codex_responses import (
     add_synthetic_web_search_citations,
     build_codex_headers,
+    client_requested_web_search,
     collect_codex_responses_native_response,
     collect_codex_responses_text_and_usage,
     convert_chat_completions_to_codex_responses,
@@ -363,6 +364,11 @@ def _extract_codex_session_id(req: ChatCompletionRequest, request: Request) -> s
             if isinstance(value, str) and value.strip():
                 return value.strip()[:128]
     return None
+
+
+def _search_enabled_for(req: ChatCompletionRequest) -> bool:
+    """Web search is opt-in per request, and only when the operator allows it."""
+    return settings.enable_search and client_requested_web_search(req)
 
 
 # Environment variables the Claude CLI subprocess may inherit in isolated mode.
@@ -2449,7 +2455,7 @@ async def responses(
                     force_stream=True,
                     reasoning_effort_override=("high" if reasoning_effort == "xhigh" else reasoning_effort),
                     allow_tools=settings.codex_allow_tools,
-                    enable_search=settings.enable_search,
+                    enable_search=_search_enabled_for(chat_req),
                     enable_image_gen=settings.enable_image_gen,
                 )
 
@@ -2995,7 +3001,7 @@ async def chat_completions(
                                         "high" if reasoning_effort == "xhigh" else reasoning_effort
                                     ),
                                     allow_tools=settings.codex_allow_tools,
-                                    enable_search=settings.enable_search,
+                                    enable_search=_search_enabled_for(req),
                                     enable_image_gen=settings.enable_image_gen,
                                 )
                                 events = iter_codex_responses_events(
@@ -3036,7 +3042,7 @@ async def chat_completions(
                                 skip_git_repo_check=settings.skip_git_repo_check,
                                 model_reasoning_effort=reasoning_effort,
                                 approval_policy=settings.approval_policy,
-                                enable_search=settings.enable_search,
+                                enable_search=_search_enabled_for(req),
                                 add_dirs=settings.add_dirs,
                                 codex_cli_home=settings.codex_cli_home,
                                 timeout_seconds=settings.timeout_seconds,
@@ -3346,7 +3352,7 @@ async def chat_completions(
                                         "high" if reasoning_effort == "xhigh" else reasoning_effort
                                     ),
                                     allow_tools=settings.codex_allow_tools,
-                                    enable_search=settings.enable_search,
+                                    enable_search=_search_enabled_for(req),
                                     enable_image_gen=settings.enable_image_gen,
                                 )
                                 events = iter_codex_responses_events(
@@ -3368,7 +3374,7 @@ async def chat_completions(
                                     skip_git_repo_check=settings.skip_git_repo_check,
                                     model_reasoning_effort=reasoning_effort,
                                     approval_policy=settings.approval_policy,
-                                    enable_search=settings.enable_search,
+                                    enable_search=_search_enabled_for(req),
                                     add_dirs=settings.add_dirs,
                                     codex_cli_home=settings.codex_cli_home,
                                     timeout_seconds=settings.timeout_seconds,
