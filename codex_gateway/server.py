@@ -322,11 +322,13 @@ def _extract_reasoning_effort(req: ChatCompletionRequest) -> str | None:
         direct = extra.get("reasoning_effort")
         if isinstance(direct, str) and direct.strip():
             return direct.strip()
-        reasoning = extra.get("reasoning")
-        if isinstance(reasoning, dict):
-            effort = reasoning.get("effort")
-            if isinstance(effort, str) and effort.strip():
-                return effort.strip()
+        # OpenAI-style `reasoning.effort` and Anthropic-style `output_config.effort`.
+        for container_key in ("reasoning", "output_config"):
+            container = extra.get(container_key)
+            if isinstance(container, dict):
+                effort = container.get("effort")
+                if isinstance(effort, str) and effort.strip():
+                    return effort.strip()
     return None
 
 
@@ -365,7 +367,18 @@ _CLAUDE_ENV_ALLOWLIST = (
 )
 
 
-def _claude_cli_cmd(claude_model: str | None, prompt: str) -> list[str]:
+_CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+
+
+def _normalize_claude_effort(raw: str | None) -> str | None:
+    """Map a requested effort to a `claude --effort` level, or None to keep the CLI default."""
+    value = (raw or "").strip().lower()
+    if value in {"none", "minimal"}:
+        return "low"
+    return value if value in _CLAUDE_EFFORTS else None
+
+
+def _claude_cli_cmd(claude_model: str | None, prompt: str, effort: str | None = None) -> list[str]:
     cmd = [settings.claude_bin, "--verbose", "-p", "--output-format", "stream-json"]
     if settings.claude_isolated:
         cmd.extend(
@@ -387,6 +400,8 @@ def _claude_cli_cmd(claude_model: str | None, prompt: str) -> list[str]:
             cmd.extend(["--add-dir", d])
     if claude_model:
         cmd.extend(["--model", claude_model])
+    if effort:
+        cmd.extend(["--effort", effort])
     cmd.append("--")
     cmd.append(prompt)
     return cmd
@@ -980,6 +995,10 @@ def _summarize_tools(value: object, *, max_items: int = 8) -> str | None:
     return f"[{', '.join(labels)}]"
 
 
+def _is_empty_extra(value: object) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
 def _format_request_value(key: str, value: object, *, max_len: int = 160) -> str:
     if key in {"tools", "functions"}:
         summary = _summarize_tools(value)
@@ -1101,11 +1120,11 @@ def _format_request_metadata(
         ]
         seen = set()
         for key in preferred:
-            if key in extra and key not in skip:
+            if key in extra and key not in skip and not _is_empty_extra(extra[key]):
                 extra_items.append((key, _format_request_value(key, extra[key])))
                 seen.add(key)
         for key in sorted(extra.keys()):
-            if key in skip or key in seen:
+            if key in skip or key in seen or _is_empty_extra(extra[key]):
                 continue
             extra_items.append((key, _format_request_value(key, extra[key])))
 
@@ -2033,7 +2052,7 @@ async def responses(
                     usage_str = f" usage={usage}" if isinstance(usage, dict) else ""
                     logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
                     logger.info("[%s] RESPONSE:\n%s", resp_id, _truncate_for_log(text))
-            elif not settings.log_render_markdown:
+            else:
                 usage_str = f" usage={usage}" if isinstance(usage, dict) else ""
                 logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
             return JSONResponse(content=native_response, headers=response_headers)
@@ -2245,7 +2264,20 @@ async def chat_completions(
             effort_source = "request"
         elif not default_effort:
             effort_source = "fallback"
-        
+
+        # The Claude CLI only gets --effort when the operator forces one or the client asks for one;
+        # otherwise the CLI keeps its own default. The Codex default effort does not apply.
+        claude_effort = _normalize_claude_effort(forced_effort_raw) or _normalize_claude_effort(request_effort_raw)
+        logged_effort, logged_effort_source = reasoning_effort, effort_source
+        if provider == "claude" and not use_claude_oauth:
+            logged_effort = claude_effort or "cli-default"
+            if claude_effort and _normalize_claude_effort(forced_effort_raw):
+                logged_effort_source = "forced"
+            elif claude_effort:
+                logged_effort_source = "request"
+            else:
+                logged_effort_source = "default"
+
         # Track concurrent requests
         global _active_requests
         _active_requests += 1
@@ -2271,8 +2303,8 @@ async def chat_completions(
             resolved_model=resolved_model,
             provider=provider,
             mode_label=mode_label,
-            reasoning_effort=reasoning_effort,
-            effort_source=effort_source,
+            reasoning_effort=logged_effort,
+            effort_source=logged_effort_source,
             request_effort_raw=request_effort_raw,
         )
         if settings.log_render_markdown:
@@ -2654,7 +2686,7 @@ async def chat_completions(
                             )
                             text, usage = await claude_oauth_generate(req=req2, model_name=claude_model)
                         else:
-                            cmd = _claude_cli_cmd(claude_model, prompt)
+                            cmd = _claude_cli_cmd(claude_model, prompt, claude_effort)
 
                             assembler = TextAssembler()
                             fallback_text = None
@@ -2746,9 +2778,8 @@ async def chat_completions(
                     usage_str = f" usage={usage}" if isinstance(usage, dict) else ""
                     logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
                     logger.info("[%s] RESPONSE:\n%s", resp_id, _truncate_for_log(text))
-            elif not settings.log_render_markdown:
+            else:
                 _pending_questions.pop(resp_id, None)  # Clean up
-                # Only log summary when not using rich panels
                 usage_str = f" usage={usage}" if isinstance(usage, dict) else ""
                 logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
             finish_reason = "tool_calls" if tool_calls else "stop"
@@ -2780,6 +2811,8 @@ async def chat_completions(
             assembled_text = ""
             stream_usage: dict[str, object] | None = None
             stream_tool_calls: list[dict[str, object]] | None = None
+            # "aborted" unless the stream reaches [DONE]; covers crashes and closed connections.
+            stream_outcome = "aborted"
             try:
                 async with sem:
                     # initial role chunk
@@ -2930,7 +2963,7 @@ async def chat_completions(
                                 )
                                 events = iter_claude_oauth_events(req=req2, model_name=claude_model)
                             else:
-                                cmd = _claude_cli_cmd(claude_model, prompt)
+                                cmd = _claude_cli_cmd(claude_model, prompt, claude_effort)
                                 events = _guard_claude_substitution(
                                     iter_stream_json_events(
                                         cmd=cmd,
@@ -2998,6 +3031,7 @@ async def chat_completions(
                         try:
                             while True:
                                 if await request.is_disconnected():
+                                    stream_outcome = "disconnected"
                                     return
 
                                 try:
@@ -3030,6 +3064,7 @@ async def chat_completions(
                                         should_retry = True
                                         break
 
+                                    stream_outcome = "error"
                                     if msg:
                                         status = _extract_upstream_status_code(msg) or 500
                                         logger.error(
@@ -3165,6 +3200,8 @@ async def chat_completions(
                         yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
                     yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
+                    if stream_outcome == "aborted":
+                        stream_outcome = "ok"
             finally:
                 if tmpdir is not None:
                     tmpdir.cleanup()
@@ -3175,11 +3212,24 @@ async def chat_completions(
                 
                 # Record stats and decrement active count
                 _active_requests -= 1
-                _request_stats.record_success(duration_ms, stream_usage)
+                if stream_outcome == "ok":
+                    _request_stats.record_success(duration_ms, stream_usage)
+                else:
+                    _request_stats.record_failure()
+                    _pending_questions.pop(resp_id, None)
+                    logger.warning(
+                        "[%s] stream ended status=%s duration_ms=%d chars=%d",
+                        resp_id,
+                        stream_outcome,
+                        duration_ms,
+                        len(assembled),
+                    )
                 _maybe_print_stats()
 
                 suppress_final = settings.log_stream_inline and settings.log_stream_inline_suppress_final
-                if suppress_final:
+                if stream_outcome != "ok":
+                    pass
+                elif suppress_final:
                     _pending_questions.pop(resp_id, None)
                     if not settings.log_render_markdown:
                         usage_str = f" usage={stream_usage}" if isinstance(stream_usage, dict) else ""
@@ -3205,7 +3255,7 @@ async def chat_completions(
                         usage_str = f" usage={stream_usage}" if isinstance(stream_usage, dict) else ""
                         logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(assembled), usage_str)
                         logger.info("[%s] RESPONSE:\n%s", resp_id, _truncate_for_log(assembled))
-                elif not settings.log_render_markdown:
+                else:
                     _pending_questions.pop(resp_id, None)  # Clean up
                     usage_str = f" usage={stream_usage}" if isinstance(stream_usage, dict) else ""
                     logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(assembled), usage_str)
