@@ -4,6 +4,8 @@ import base64
 import json
 import logging
 import mimetypes
+import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -18,6 +20,25 @@ from .http_client import get_async_client, request_json_with_retries
 from .openai_compat import ChatCompletionRequest, ChatMessage, RequestInputError, normalize_message_content
 
 _ANTHROPIC_VERSION = "2023-06-01"
+# Claude subscription OAuth tokens (`claude setup-token`, OAuth login) are only accepted by the
+# Messages API with this beta header and the Claude Code identity as the first system block;
+# otherwise the API answers with a 429 rate_limit_error.
+_OAUTH_BETA = "oauth-2025-04-20"
+_CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+# Follows the required identity so the model does not act as the Claude Code CLI.
+_API_CONTEXT = (
+    "Here you are Claude, a general-purpose AI assistant made by Anthropic, reached through an API. "
+    "You are not running as the Claude Code CLI: there is no terminal, file system or code execution. "
+    "The only tools you can use are the ones defined in this request, if any. Do not describe or "
+    "speculate about the infrastructure this conversation runs on."
+)
+# The Messages API does not know Claude Code's model aliases; resolve them the way `claude --model` does.
+_CLAUDE_MODEL_ALIASES = {
+    "opus": "claude-opus-5-5",
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 _DEFAULT_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 logger = logging.getLogger("uvicorn.error")
@@ -483,83 +504,115 @@ def _extract_usage_from_anthropic_response(data: Any) -> dict[str, int] | None:
     return {"prompt_tokens": in_tokens, "completion_tokens": out_tokens, "total_tokens": in_tokens + out_tokens}
 
 
-def _get_auth_and_url() -> tuple[str, str]:
-    """
-    Get auth token and base URL, preferring Claude CLI settings.json config.
-    Falls back to OAuth creds and gateway settings if CLI config not available.
-    """
+@dataclass(frozen=True)
+class _ClaudeAuth:
+    token: str
+    base_url: str
+    # True for Claude subscription OAuth tokens, which need the beta header and Claude Code identity.
+    subscription: bool
+    default_sonnet_model: str | None = None
+
+
+async def _resolve_auth() -> _ClaudeAuth:
+    """CLI settings.json (API-key style proxy) first, then CLAUDE_CODE_OAUTH_TOKEN, then the OAuth creds file."""
     cli_config = get_claude_cli_config()
-    
-    # Prefer CLI config (from ~/.claude/settings.json)
     if cli_config.auth_token and cli_config.base_url:
-        logger.debug("Using Claude CLI config: base_url=%s", cli_config.base_url)
-        return cli_config.auth_token, cli_config.base_url
-    
-    # Fall back to OAuth creds
-    creds_path = Path(settings.claude_oauth_creds_path).expanduser()
-    creds = _load_creds(creds_path)
-    if creds.access_token:
-        return creds.access_token, settings.claude_api_base_url
-    
-    raise RuntimeError(
-        "Claude API: no authentication available. "
-        "Either configure ANTHROPIC_AUTH_TOKEN in ~/.claude/settings.json, "
-        "or run claude-oauth-login to set up OAuth credentials."
-    )
+        return _ClaudeAuth(cli_config.auth_token, cli_config.base_url, False, cli_config.default_model)
+    env_token = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+    if env_token:
+        return _ClaudeAuth(env_token, settings.claude_api_base_url, True)
+    creds = await maybe_refresh_claude_oauth(settings.claude_oauth_creds_path)
+    if not creds.access_token:
+        raise RuntimeError(
+            "Claude API: no authentication available. Set CLAUDE_CODE_OAUTH_TOKEN (claude setup-token), "
+            "configure ANTHROPIC_AUTH_TOKEN in ~/.claude/settings.json, or run claude-oauth-login."
+        )
+    return _ClaudeAuth(creds.access_token, settings.claude_api_base_url, True)
+
+
+def _api_model_name(model_name: str, auth: _ClaudeAuth) -> str:
+    """Resolve CLI aliases to Messages API model IDs; `[1m]` is dropped because 1M context is the default."""
+    name = model_name.strip()
+    if name.lower().endswith("[1m]"):
+        name = name[: -len("[1m]")]
+    alias = name.lower()
+    if alias == "sonnet" and auth.default_sonnet_model:
+        return auth.default_sonnet_model
+    return _CLAUDE_MODEL_ALIASES.get(alias, name)
+
+
+def _supported_effort(model_name: str, effort: str | None) -> str | None:
+    """`output_config.effort` for models that accept the level, else None (the model default)."""
+    if effort not in _EFFORT_LEVELS:
+        return None
+    m = re.match(r"claude-(opus|sonnet|fable|mythos)-(\d+)(?:-(\d+))?(?:-\d{8})?$", model_name)
+    if not m:
+        return None
+    version = (int(m.group(2)), int(m.group(3) or 0))
+    if version >= (4, 7):
+        return effort
+    if version == (4, 6) and effort != "xhigh":
+        return effort
+    if m.group(1) == "opus" and version == (4, 5) and effort in {"low", "medium", "high"}:
+        return effort
+    return None
+
+
+def _build_request(
+    req: ChatCompletionRequest,
+    *,
+    model_name: str,
+    auth: _ClaudeAuth,
+    stream: bool,
+    effort: str | None,
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    system, messages = _openai_messages_to_anthropic(req)
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "max_tokens": int(req.max_tokens or 16000),
+        "messages": messages,
+    }
+    if stream:
+        payload["stream"] = True
+    system_blocks: list[dict[str, Any]] = []
+    if auth.subscription:
+        system_blocks.append({"type": "text", "text": _CLAUDE_CODE_IDENTITY})
+        system_blocks.append({"type": "text", "text": _API_CONTEXT})
+    if system:
+        system_blocks.append({"type": "text", "text": system})
+    if system_blocks:
+        payload["system"] = system_blocks
+    api_effort = _supported_effort(model_name, effort)
+    if api_effort:
+        payload["output_config"] = {"effort": api_effort}
+    _apply_openai_tools(payload, req)
+
+    headers = {
+        "Authorization": f"Bearer {auth.token}",
+        "anthropic-version": _ANTHROPIC_VERSION,
+        "Accept": "text/event-stream" if stream else "application/json",
+    }
+    if auth.subscription:
+        headers["anthropic-beta"] = _OAUTH_BETA
+    return f"{auth.base_url.rstrip('/')}/v1/messages", headers, payload
 
 
 async def generate_oauth(
     *,
     req: ChatCompletionRequest,
     model_name: str,
+    effort: str | None = None,
 ) -> tuple[str, dict[str, int] | None, list[dict[str, Any]]]:
-    t0 = time.time()
-    
-    # Try CLI config first, then OAuth creds
-    cli_config = get_claude_cli_config()
-    
-    if cli_config.auth_token and cli_config.base_url:
-        # Use CLI config directly (API key style)
-        auth_token = cli_config.auth_token
-        base_url = cli_config.base_url
-        # Use CLI's default model if model_name is generic
-        if model_name in ("sonnet", "opus", "haiku") and cli_config.default_model:
-            model_name = cli_config.default_model
-        logger.debug("Using Claude CLI config: base_url=%s model=%s", base_url, model_name)
-    else:
-        # Fall back to OAuth flow
-        creds = await maybe_refresh_claude_oauth(settings.claude_oauth_creds_path)
-        if not creds.access_token:
-            raise RuntimeError("Claude OAuth: missing access_token (set up OAuth credentials first)")
-        auth_token = creds.access_token
-        base_url = settings.claude_api_base_url
+    auth = await _resolve_auth()
+    model_name = _api_model_name(model_name, auth)
+    url, headers, payload = _build_request(req, model_name=model_name, auth=auth, stream=False, effort=effort)
 
-    t_auth = time.time()
-    
-    system, messages = _openai_messages_to_anthropic(req)
-    max_tokens = int(req.max_tokens or 8192)
-    payload: dict[str, Any] = {
-        "model": model_name,
-        "max_tokens": max_tokens,
-        "messages": messages,
-    }
-    if system:
-        payload["system"] = system
-    _apply_openai_tools(payload, req)
-
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "anthropic-version": _ANTHROPIC_VERSION,
-        "Accept": "application/json",
-    }
-    url = f"{base_url.rstrip('/')}/v1/messages"
-    
     t_prepare = time.time()
     logger.debug(
         "claude-oauth request: url=%s model=%s max_tokens=%d msg_count=%d",
-        url, model_name, max_tokens, len(messages),
+        url, model_name, payload["max_tokens"], len(payload["messages"]),
     )
-    
+
     client = await get_async_client("claude")
     resp = await request_json_with_retries(
         client=client,
@@ -746,44 +799,11 @@ async def iter_oauth_stream_events(
     *,
     req: ChatCompletionRequest,
     model_name: str,
+    effort: str | None = None,
 ) -> AsyncIterator[dict]:
-    # Try CLI config first, then OAuth creds
-    cli_config = get_claude_cli_config()
-    
-    if cli_config.auth_token and cli_config.base_url:
-        # Use CLI config directly (API key style)
-        auth_token = cli_config.auth_token
-        base_url = cli_config.base_url
-        # Use CLI's default model if model_name is generic
-        if model_name in ("sonnet", "opus", "haiku") and cli_config.default_model:
-            model_name = cli_config.default_model
-        logger.debug("Using Claude CLI config for streaming: base_url=%s model=%s", base_url, model_name)
-    else:
-        # Fall back to OAuth flow
-        creds = await maybe_refresh_claude_oauth(settings.claude_oauth_creds_path)
-        if not creds.access_token:
-            raise RuntimeError("Claude OAuth: missing access_token (set up OAuth credentials first)")
-        auth_token = creds.access_token
-        base_url = settings.claude_api_base_url
-
-    system, messages = _openai_messages_to_anthropic(req)
-    max_tokens = int(req.max_tokens or 8192)
-    payload: dict[str, Any] = {
-        "model": model_name,
-        "max_tokens": max_tokens,
-        "messages": messages,
-        "stream": True,
-    }
-    if system:
-        payload["system"] = system
-    _apply_openai_tools(payload, req)
-
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "anthropic-version": _ANTHROPIC_VERSION,
-        "Accept": "text/event-stream",
-    }
-    url = f"{base_url.rstrip('/')}/v1/messages"
+    auth = await _resolve_auth()
+    model_name = _api_model_name(model_name, auth)
+    url, headers, payload = _build_request(req, model_name=model_name, auth=auth, stream=True, effort=effort)
 
     usage: dict[str, int] | None = None
     # tool_use blocks by content index: [id, name, partial_json chunks, input from content_block_start]

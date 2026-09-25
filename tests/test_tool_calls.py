@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import json
+import os
 import unittest
 from unittest import mock
 
@@ -119,22 +120,35 @@ class _MockAnthropic:
 
     def __init__(self) -> None:
         self.payloads: list[dict] = []
+        self.headers: list[httpx.Headers] = []
+        self.urls: list[httpx.URL] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         self.payloads.append(payload)
+        self.headers.append(request.headers)
+        self.urls.append(request.url)
         if payload.get("stream"):
             return httpx.Response(200, text=_claude_sse(), headers={"content-type": "text/event-stream"})
         return httpx.Response(200, json=_CLAUDE_MESSAGE)
 
-    def patches(self):
+    def patches(self, *, subscription_token: str | None = None):
+        """Serve requests from this mock; with `subscription_token`, authenticate like `claude setup-token`."""
+
         async def client(_name: str = "default") -> httpx.AsyncClient:
             return httpx.AsyncClient(transport=httpx.MockTransport(self.handler))
 
-        cli_config = claude_oauth.ClaudeCliConfig("https://anthropic.test", "test-token", None)
+        if subscription_token:
+            cli_config = claude_oauth.ClaudeCliConfig(None, None, None)
+            env = mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": subscription_token})
+        else:
+            cli_config = claude_oauth.ClaudeCliConfig("https://anthropic.test", "test-token", None)
+            env_without_token = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}
+            env = mock.patch.dict(os.environ, env_without_token, clear=True)
         return (
             mock.patch.object(claude_oauth, "get_async_client", client),
             mock.patch.object(claude_oauth, "get_claude_cli_config", lambda: cli_config),
+            env,
         )
 
 
@@ -146,9 +160,9 @@ _EXPECTED_CALL = {
 
 
 class ClaudeOAuthToolTests(unittest.TestCase):
-    def _run(self, coro, api: _MockAnthropic):
-        p1, p2 = api.patches()
-        with p1, p2:
+    def _run(self, coro, api: _MockAnthropic, **patch_kwargs):
+        p1, p2, p3 = api.patches(**patch_kwargs)
+        with p1, p2, p3:
             return asyncio.run(coro)
 
     def test_request_carries_tools_and_tool_choice(self) -> None:
@@ -225,12 +239,87 @@ class ClaudeOAuthToolTests(unittest.TestCase):
         self.assertEqual(calls, [{"type": "gateway.tool_calls", "tool_calls": [_EXPECTED_CALL]}])
 
 
+    def test_subscription_token_sends_beta_header_and_claude_code_identity(self) -> None:
+        api = _MockAnthropic()
+        req = ChatCompletionRequest(
+            model="claude-sonnet-5",
+            messages=[{"role": "system", "content": "You are Tchat."}, {"role": "user", "content": "cat"}],
+            tools=[_IMAGE_TOOL],
+        )
+        self._run(claude_oauth.generate_oauth(req=req, model_name="opus[1m]"), api, subscription_token="sk-ant-oat01-test")
+
+        headers, payload = api.headers[0], api.payloads[0]
+        self.assertEqual(headers["authorization"], "Bearer sk-ant-oat01-test")
+        self.assertEqual(headers["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(str(api.urls[0]), "https://api.anthropic.com/v1/messages")
+        self.assertEqual(
+            [b["text"] for b in payload["system"]],
+            ["You are Claude Code, Anthropic's official CLI for Claude.", claude_oauth._API_CONTEXT, "You are Tchat."],
+        )
+        self.assertEqual(payload["model"], "claude-opus-5-5")
+
+    def test_api_key_proxy_sends_client_system_only(self) -> None:
+        api = _MockAnthropic()
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "system", "content": "You are Tchat."}, {"role": "user", "content": "cat"}]
+        )
+        self._run(claude_oauth.generate_oauth(req=req, model_name="claude-sonnet-5"), api)
+
+        self.assertNotIn("anthropic-beta", api.headers[0])
+        self.assertEqual([b["text"] for b in api.payloads[0]["system"]], ["You are Tchat."])
+
+    def test_model_aliases_resolve_like_the_cli(self) -> None:
+        oauth = claude_oauth._ClaudeAuth("t", "https://api.anthropic.com", True)
+        cases = {
+            "opus": "claude-opus-5-5",
+            "sonnet": "claude-sonnet-5",
+            "haiku": "claude-haiku-4-5-20251001",
+            "opus[1m]": "claude-opus-5-5",
+            "claude-opus-5-5[1m]": "claude-opus-5-5",
+            "claude-sonnet-4-6": "claude-sonnet-4-6",
+        }
+        for requested, expected in cases.items():
+            with self.subTest(requested=requested):
+                self.assertEqual(claude_oauth._api_model_name(requested, oauth), expected)
+
+    def test_default_sonnet_model_only_replaces_sonnet(self) -> None:
+        proxy = claude_oauth._ClaudeAuth("t", "https://proxy.test", False, "vendor-sonnet")
+
+        self.assertEqual(claude_oauth._api_model_name("sonnet", proxy), "vendor-sonnet")
+        self.assertEqual(claude_oauth._api_model_name("opus", proxy), "claude-opus-5-5")
+        self.assertEqual(claude_oauth._api_model_name("haiku", proxy), "claude-haiku-4-5-20251001")
+
+    def test_effort_is_sent_only_where_the_model_accepts_it(self) -> None:
+        cases = [
+            ("claude-opus-5-5", "xhigh", "xhigh"),
+            ("claude-sonnet-5", "max", "max"),
+            ("claude-opus-4-7", "xhigh", "xhigh"),
+            ("claude-sonnet-4-6", "high", "high"),
+            ("claude-sonnet-4-6", "xhigh", None),
+            ("claude-opus-4-5", "medium", "medium"),
+            ("claude-opus-4-5", "max", None),
+            ("claude-sonnet-4-5", "high", None),
+            ("claude-haiku-4-5-20251001", "low", None),
+            ("claude-opus-5-5", None, None),
+        ]
+        for model, effort, expected in cases:
+            with self.subTest(model=model, effort=effort):
+                self.assertEqual(claude_oauth._supported_effort(model, effort), expected)
+
+    def test_effort_goes_in_output_config(self) -> None:
+        api = _MockAnthropic()
+        req = ChatCompletionRequest(model="x", messages=[{"role": "user", "content": "cat"}])
+        self._run(claude_oauth.generate_oauth(req=req, model_name="claude-opus-5-5", effort="high"), api)
+
+        self.assertEqual(api.payloads[0]["output_config"], {"effort": "high"})
+
+
 class ClaudeOAuthChatCompletionsTests(unittest.TestCase):
     def _post(self, body: dict) -> httpx.Response:
         api = _MockAnthropic()
         oauth_settings = dataclasses.replace(server.settings, claude_use_oauth_api=True, bearer_token=None)
-        p1, p2 = api.patches()
-        with p1, p2, mock.patch.object(server, "settings", oauth_settings):
+        p1, p2, p3 = api.patches()
+        with p1, p2, p3, mock.patch.object(server, "settings", oauth_settings):
             resp = TestClient(server.app).post("/v1/chat/completions", json=body)
         self.assertEqual(api.payloads[0]["tools"][0]["name"], "gemini_image_gen")
         return resp

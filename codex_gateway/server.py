@@ -1926,7 +1926,12 @@ async def _log_startup_config() -> None:
         cli_config = get_claude_cli_config()
         effective_url = cli_config.base_url or settings.claude_api_base_url
         effective_model = cli_config.default_model or settings.claude_model or "sonnet"
-        config_source = "CLI settings.json" if cli_config.base_url else "default"
+        if cli_config.base_url and cli_config.auth_token:
+            config_source = "CLI settings.json"
+        elif os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            config_source = "CLAUDE_CODE_OAUTH_TOKEN"
+        else:
+            config_source = "OAuth creds file"
         mode = "OAuth API" if settings.claude_use_oauth_api else "CLI"
         items.extend([
             ("mode", mode, "yellow"),
@@ -3159,7 +3164,9 @@ async def chat_completions(
                             msgs = _maybe_inject_automation_guard_messages(req.messages)
                             # Keep client extras (tools, tool_choice, parallel_tool_calls) for the Messages API.
                             req2 = req.model_copy(update={"messages": msgs})
-                            text, usage, claude_tool_calls = await claude_oauth_generate(req=req2, model_name=claude_model)
+                            text, usage, claude_tool_calls = await claude_oauth_generate(
+                                req=req2, model_name=claude_model, effort=claude_effort
+                            )
                             tool_calls = claude_tool_calls or None
                         else:
                             cmd = _claude_cli_cmd(claude_model, prompt, claude_effort)
@@ -3434,7 +3441,9 @@ async def chat_completions(
                                 msgs = _maybe_inject_automation_guard_messages(req.messages)
                                 # Keep client extras (tools, tool_choice, parallel_tool_calls) for the Messages API.
                                 req2 = req.model_copy(update={"messages": msgs})
-                                events = iter_claude_oauth_events(req=req2, model_name=claude_model)
+                                events = iter_claude_oauth_events(
+                                    req=req2, model_name=claude_model, effort=claude_effort
+                                )
                             else:
                                 cmd = _claude_cli_cmd(claude_model, prompt, claude_effort)
                                 events = _guard_claude_substitution(
