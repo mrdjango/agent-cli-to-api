@@ -55,6 +55,30 @@ class RequestMetadataTests(unittest.TestCase):
         self.assertIn("metadata", md)
         self.assertIn("reasoning_effort=effective=cli-default", plain)
 
+    def test_non_tty_log_keeps_bracketed_text(self) -> None:
+        import io
+
+        from rich.console import Console
+
+        buf = io.StringIO()
+        console = Console(file=buf, force_terminal=False, color_system=None, width=200)
+        console._is_real_tty = False  # type: ignore[attr-defined]
+        md, _plain = server._format_request_metadata(
+            _chat_req(tools=[{"type": "function", "function": {"name": "Bash"}}]),
+            resolved_model="claude-opus-5",
+            provider="claude",
+            mode_label="cli",
+            reasoning_effort="cli-default",
+            effort_source="default",
+            request_effort_raw=None,
+        )
+        cfg = dataclasses.replace(server.settings, log_render_markdown=True)
+        with mock.patch.object(server, "settings", cfg), mock.patch.object(server, "_get_rich_console", return_value=console):
+            server._maybe_print_markdown("chatcmpl-e5fcfd8b0000", "REQUEST PARAMS", md)
+        out = buf.getvalue()
+        self.assertIn("[function:Bash]", out)
+        self.assertIn("Request Params [e5fcfd8b]", out)
+
 
 class StreamOutcomeTests(unittest.TestCase):
     def _run_stream(self, events: list[dict]) -> tuple[str, server.RequestStats, list[list[str]]]:

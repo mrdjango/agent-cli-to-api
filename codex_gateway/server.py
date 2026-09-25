@@ -89,6 +89,15 @@ if not logger.handlers:
     logger.setLevel(logging.DEBUG)
 
 
+def _esc(text: object) -> str:
+    """Escape text for Rich markup so literal "[...]" (tool lists, ids, code) is printed as-is."""
+    try:
+        from rich.markup import escape
+    except Exception:
+        return str(text)
+    return escape(str(text))
+
+
 def _get_rich_console():
     """Get or create a shared Rich Console that always outputs color, even in non-TTY (launchd)."""
     global _RICH_CONSOLE
@@ -1356,13 +1365,13 @@ def _maybe_print_markdown(
         try:
             from rich.markdown import Markdown
             from rich.panel import Panel
-            console.print(Panel(Markdown(payload), title=title, border_style=style, expand=False))
+            console.print(Panel(Markdown(payload), title=_esc(title), border_style=style, expand=False))
         except Exception:
-            console.print(f"[bold {style}]━━━ {title} ━━━[/]\n{payload}\n")
+            console.print(f"[bold {style}]━━━ {_esc(title)} ━━━[/]\n{_esc(payload)}\n")
     else:
         # Non-TTY (log file): use flowing colored text — no fixed-width boxes
-        console.print(f"\n[bold {style}]━━━ {title} ━━━[/bold {style}]", soft_wrap=True)
-        console.print(f"[{style}]{payload}[/{style}]", soft_wrap=True, highlight=False)
+        console.print(f"\n[bold {style}]━━━ {_esc(title)} ━━━[/bold {style}]", soft_wrap=True)
+        console.print(f"[{style}]{_esc(payload)}[/{style}]", soft_wrap=True, highlight=False)
         console.print(f"[dim {style}]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim {style}]\n", soft_wrap=True)
     return True
 
@@ -1423,13 +1432,13 @@ def _print_qa_together(
         try:
             from rich.markdown import Markdown
             from rich.panel import Panel
-            console.print(Panel(Markdown(combined), title=title, border_style="blue", expand=False))
+            console.print(Panel(Markdown(combined), title=_esc(title), border_style="blue", expand=False))
         except Exception:
-            console.print(f"[bold blue]━━━ {title} ━━━[/]\n{combined}\n")
+            console.print(f"[bold blue]━━━ {_esc(title)} ━━━[/]\n{_esc(combined)}\n")
     else:
         if question:
-            console.print(f"\n[bold cyan]━━━ 📝 Question [{short}] ({len(question):,} chars) ━━━[/bold cyan]", soft_wrap=True)
-            console.print(f"[cyan]{question.rstrip()}[/cyan]", soft_wrap=True, highlight=False)
+            console.print(f"\n[bold cyan]━━━ 📝 Question {_esc(f'[{short}]')} ({len(question):,} chars) ━━━[/bold cyan]", soft_wrap=True)
+            console.print(f"[cyan]{_esc(question.rstrip())}[/cyan]", soft_wrap=True, highlight=False)
         if answer:
             parts = [f"✅ Answer [{short}]"]
             if duration_ms:
@@ -1438,8 +1447,8 @@ def _print_qa_together(
                 total = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
                 if total > 0:
                     parts.append(f"🔢 {total:,} tokens")
-            console.print(f"[bold green]━━━ {' '.join(parts)} ━━━[/bold green]", soft_wrap=True)
-            console.print(f"[green]{answer.rstrip()}[/green]", soft_wrap=True, highlight=False)
+            console.print(f"[bold green]━━━ {_esc(' '.join(parts))} ━━━[/bold green]", soft_wrap=True)
+            console.print(f"[green]{_esc(answer.rstrip())}[/green]", soft_wrap=True, highlight=False)
         console.print(f"[dim blue]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim blue]\n", soft_wrap=True)
     return True
 
@@ -1458,15 +1467,15 @@ def _print_error_panel(resp_id: str, error_msg: str, status_code: int = 500) -> 
             from rich.text import Text
             console.print(Panel(
                 Text(error_msg, style="bold white"),
-                title=f"❌ Error [{short}] HTTP {status_code}",
+                title=_esc(f"❌ Error [{short}] HTTP {status_code}"),
                 border_style="red",
                 expand=False,
             ))
         except Exception:
-            console.print(f"[bold red]━━━ ❌ Error [{short}] HTTP {status_code} ━━━[/]\n[red]{error_msg}[/red]\n")
+            console.print(f"[bold red]━━━ ❌ Error {_esc(f'[{short}]')} HTTP {status_code} ━━━[/]\n[red]{_esc(error_msg)}[/red]\n")
     else:
-        console.print(f"\n[bold red]━━━ ❌ Error [{short}] HTTP {status_code} ━━━[/bold red]", soft_wrap=True)
-        console.print(f"[red]{error_msg}[/red]", soft_wrap=True)
+        console.print(f"\n[bold red]━━━ ❌ Error {_esc(f'[{short}]')} HTTP {status_code} ━━━[/bold red]", soft_wrap=True)
+        console.print(f"[red]{_esc(error_msg)}[/red]", soft_wrap=True)
         console.print(f"[dim red]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim red]\n", soft_wrap=True)
 
 
@@ -1694,7 +1703,7 @@ async def _log_startup_config() -> None:
                     table.add_row(key, f"[{style}]{value}[/{style}]")
                 console.print(Panel(
                     table,
-                    title=f"{emoji} Agent CLI Gateway [{provider}]",
+                    title=_esc(f"{emoji} Agent CLI Gateway [{provider}]"),
                     subtitle=f"📍 http://{settings.host}:{settings.port}",
                     border_style="green",
                     expand=False,
@@ -1703,9 +1712,9 @@ async def _log_startup_config() -> None:
             except Exception:
                 pass
         # Non-TTY or Panel failed: flowing colored text
-        console.print(f"\n[bold green]━━━ {emoji} Agent CLI Gateway [{provider}] ━━━[/bold green]", soft_wrap=True)
+        console.print(f"\n[bold green]━━━ {_esc(f'{emoji} Agent CLI Gateway [{provider}]')} ━━━[/bold green]", soft_wrap=True)
         for key, value, style in items:
-            console.print(f"  [dim]{key:<18}[/dim] [{style}]{value}[/{style}]", soft_wrap=True)
+            console.print(f"  [dim]{key:<18}[/dim] [{style}]{_esc(value)}[/{style}]", soft_wrap=True)
         console.print(f"  [bold green]📍 http://{settings.host}:{settings.port}[/bold green]", soft_wrap=True)
         console.print(f"[dim green]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim green]\n", soft_wrap=True)
         return
