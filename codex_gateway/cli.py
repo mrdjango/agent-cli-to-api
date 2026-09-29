@@ -16,6 +16,8 @@ def _normalize_provider(raw: str | None) -> str | None:
         return v
     if v in {"cursor-agent", "cursor_agent", "cursoragent", "cursor"}:
         return "cursor-agent"
+    if v in {"antigravity", "agy"}:
+        return "antigravity"
     return None
 
 
@@ -57,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
         "provider",
         nargs="?",
         default=None,
-        help="Provider to use: codex|gemini|claude|cursor-agent (or `doctor`).",
+        help="Provider to use: codex|gemini|claude|cursor-agent|antigravity (alias: agy) (or `doctor`).",
     )
     parser.add_argument(
         "mode",
@@ -154,6 +156,8 @@ def main(argv: list[str] | None = None) -> None:
             os.environ.setdefault("CODEX_PRESET", "codex-fast")
         elif normalized_provider == "cursor-agent":
             os.environ.setdefault("CODEX_PRESET", "cursor-auto")
+        elif normalized_provider == "antigravity":
+            os.environ.setdefault("CODEX_PRESET", "antigravity")
         elif normalized_provider == "gemini":
             creds = Path(os.environ.get("GEMINI_OAUTH_CREDS_PATH", "~/.gemini/oauth_creds.json")).expanduser()
             if creds.exists():

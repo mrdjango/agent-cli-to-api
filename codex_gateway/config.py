@@ -13,7 +13,7 @@ from typing import Literal
 
 SandboxMode = Literal["read-only", "workspace-write", "danger-full-access"]
 ApprovalPolicy = Literal["untrusted", "on-failure", "on-request", "never"]
-GatewayProvider = Literal["auto", "codex", "cursor-agent", "claude", "gemini"]
+GatewayProvider = Literal["auto", "codex", "cursor-agent", "claude", "gemini", "antigravity"]
 
 _GATEWAY_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 _DEFAULT_CODEX_CLI_HOME = os.path.join(_GATEWAY_ROOT, ".codex-gateway-home")
@@ -168,6 +168,16 @@ def _apply_preset() -> None:
             "GEMINI_USE_CLOUDCODE_API": "1",
             "GEMINI_MODEL": "gemini-3-flash-preview",
             "CODEX_MAX_CONCURRENCY": "100",  # HTTP API, maximize throughput
+            "CODEX_LOG_MODE": "qa",
+            "CODEX_LOG_MAX_CHARS": "4000",
+            "CODEX_LOG_EVENTS": "0",
+        },
+        # Google Antigravity CLI (`agy`): Gemini (and the other models agy offers) via subprocess.
+        # Clients choose the model, e.g. `gemini-3.8-flash-medium` or `agy:claude-sonnet-4-6`.
+        "antigravity": {
+            "CODEX_PROVIDER": "antigravity",
+            "CODEX_ALLOW_CLIENT_MODEL_OVERRIDE": "1",
+            "CODEX_MAX_CONCURRENCY": "10",  # each request is an agy subprocess
             "CODEX_LOG_MODE": "qa",
             "CODEX_LOG_MAX_CHARS": "4000",
             "CODEX_LOG_EVENTS": "0",
@@ -527,6 +537,21 @@ class Settings:
     gemini_oauth_client_secret: str = _env_str("GEMINI_OAUTH_CLIENT_SECRET", "").strip()
     gemini_cloudcode_base_url: str = _env_str("GEMINI_CLOUDCODE_BASE_URL", "https://cloudcode-pa.googleapis.com").strip()
     gemini_project_id: str = _env_str("GEMINI_PROJECT_ID", "").strip()
+
+    # Google Antigravity CLI (`agy`). Model IDs come from `agy models`; the effort level is part of
+    # the ID (gemini-3.1-pro-low) or, for base IDs (gemini-3.1-pro), taken from the request.
+    agy_bin: str = os.environ.get("AGY_BIN", "agy")
+    agy_model: str | None = (_env_str("AGY_MODEL", "").strip() or None)
+    # agy can read files in its workspace without asking, so it defaults to the gateway's empty
+    # temp workspace rather than a repo. Tools that need permission (shell, writes, reads outside
+    # the workspace) are auto-denied in headless mode.
+    agy_workspace: str | None = (_env_str("AGY_WORKSPACE", "").strip() or None)
+    # Run agy with terminal restrictions (`--sandbox`) as a second line of defence.
+    agy_sandbox: bool = _env_bool("AGY_SANDBOX", True)
+    # Extra args passed to `agy` (operator-controlled), e.g. AGY_EXTRA_ARGS="--project my-project".
+    agy_extra_args: list[str] = field(
+        default_factory=lambda: shlex.split(os.environ.get("AGY_EXTRA_ARGS", "") or "")
+    )
 
     # Hard safety caps.
     max_prompt_chars: int = _env_int("CODEX_MAX_PROMPT_CHARS", 200_000)

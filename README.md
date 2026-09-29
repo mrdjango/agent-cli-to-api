@@ -11,6 +11,7 @@ Supported backends:
 - **Cursor Agent** - via `cursor-agent` CLI
 - **Claude Code** - via CLI or **direct API** (auto-detects `~/.claude/settings.json` config)
 - **Gemini** - via CLI or CloudCode direct (set `GEMINI_USE_CLOUDCODE_API=1`)
+- **Google Antigravity** - via the `agy` CLI (Gemini models, plus the Claude and GPT-OSS models Antigravity offers)
 
 Why this exists:
 - Many tools/SDKs only speak the OpenAI API (`/v1/chat/completions`) - this lets you plug agent CLIs into that ecosystem.
@@ -35,7 +36,7 @@ Why this exists:
 ## Requirements
 
 - Python 3.10+ (tested on 3.13)
-- Install and authenticate the CLI(s) you want to use (`codex`, `cursor-agent`, `claude`, `gemini`)
+- Install and authenticate the CLI(s) you want to use (`codex`, `cursor-agent`, `claude`, `gemini`, `agy`)
 
 ## Install
 
@@ -82,6 +83,7 @@ uv run agent-cli-to-api codex
 uv run agent-cli-to-api gemini
 uv run agent-cli-to-api claude
 uv run agent-cli-to-api cursor-agent
+uv run agent-cli-to-api agy
 uv run agent-cli-to-api doctor
 ```
 
@@ -141,6 +143,7 @@ Supported presets:
 - `cursor-auto`
 - `cursor-fast` (Cursor model pinned for speed)
 - `gemini-cloudcode` (defaults to `gemini-3-flash-preview`)
+- `antigravity` (clients pick any model from `agy models`)
 - `claude-oauth`
 
 ### Multi-provider routing
@@ -150,6 +153,8 @@ Use `CODEX_PROVIDER=auto` and select providers per-request by prefixing `model`:
 - Cursor: `"cursor:<model>"`
 - Claude: `"claude:<model>"`
 - Gemini: `"gemini:<model>"`
+- Antigravity: `"gemini-3.8-flash-high"` (bare Gemini IDs) or `"agy:<model>"` for any model `agy models` lists, e.g. `"agy:claude-sonnet-4-6"`.
+  Bare Claude names (`claude-sonnet-4-6`) still go to the Claude provider; only the `agy:` prefix sends them through Antigravity.
 
 ### Codex backend options
 
@@ -184,6 +189,38 @@ uv run python -m codex_gateway.claude_oauth_login
 CLAUDE_USE_OAUTH_API=1 uv run agent-cli-to-api claude
 ```
 
+### Google Antigravity (`agy`)
+
+Sign in once with `agy` interactively, then:
+
+```bash
+uv run agent-cli-to-api agy
+```
+
+- `/v1/models` lists the models from `agy models`. Clients choose one per request.
+- Effort is part of most model IDs (`gemini-3.1-pro-low`). For base IDs such as `gemini-3.1-pro`,
+  a request's `reasoning_effort` is passed as `agy --effort` (low, medium, high, max).
+- Unknown model names return HTTP 400 (agy never swaps in another model).
+- agy runs as an agent with tools. In headless mode it can read files in its workspace, and it
+  auto-denies anything that needs permission (shell commands, writes, reads outside the workspace).
+  The gateway points it at an empty temp workspace, adds `--sandbox` and `--disable-slash-commands`,
+  and returns an error if a turn ends with a denied tool and no answer.
+- agy's built-in web tools (`search_web`, `read_url_content`) follow the gateway's search opt-in:
+  they run only when the request asks for web search (a `web_search` tool, `web_search_options`,
+  an Anthropic `web_search_*` tool or a Gemini `googleSearch` tool) and `CODEX_ENABLE_SEARCH` is on.
+  Other requests run in a workspace whose `.agents/hooks.json` denies those tools. Your global agy
+  settings are not changed.
+- Each request carries about 18k prompt tokens of agy's own agent instructions.
+- agy keeps a conversation history under `~/.gemini/antigravity-cli/`.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `AGY_BIN` | `agy` | Path to the CLI |
+| `AGY_MODEL` | `gemini-3.8-flash-medium` | Model when the client sends none (non-strict mode) |
+| `AGY_WORKSPACE` | gateway temp workspace | Working directory for agy |
+| `AGY_SANDBOX` | `1` | Pass `--sandbox` |
+| `AGY_EXTRA_ARGS` | | Extra CLI args, e.g. `--project my-project` |
+
 ### `uvx` (no venv)
 
 ```bash
@@ -208,9 +245,12 @@ For advanced env vars, see `.env.example` and `codex_gateway/config.py`.
 - `POST /v1/chat/completions` (supports `stream`)
 - `POST /v1/messages` (Anthropic Messages-compatible; supports `stream`)
 - `POST /v1/messages/count_tokens` (Anthropic-compatible; currently heuristic token counting)
+- `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent` (`?alt=sse` or JSON array), `:countTokens` (Gemini API-compatible; heuristic token counting)
+- `GET /v1beta/models`, `GET /v1beta/models/{model}` (Gemini API-compatible model list)
 
 Tip: any OpenAI SDK that supports `base_url` should work by pointing it at this server.
 Tip: Claude Code can point `ANTHROPIC_BASE_URL` at this server and use `ANTHROPIC_AUTH_TOKEN` for gateway auth.
+Tip: Google's `google-genai` SDKs work by setting the base URL to this server and the API key to the gateway token.
 
 Auth note: include `Authorization: Bearer <token>` only when you set `CODEX_GATEWAY_TOKEN` on the gateway.
 
@@ -284,6 +324,34 @@ curl -s http://127.0.0.1:8000/v1/messages/count_tokens \
     ]
   }'
 ```
+
+### Example (Gemini API)
+
+Any model the gateway routes can be used, not only Gemini models. Gemini clients send the gateway
+token as `x-goog-api-key` (or `?key=`, which is redacted from gateway logs).
+
+```bash
+curl -s "http://127.0.0.1:8000/v1beta/models/gemini-3.8-flash-medium:generateContent" \
+  -H "Content-Type: application/json" \
+  -H "x-goog-api-key: devtoken" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
+```
+
+```python
+from google import genai
+from google.genai import types
+
+client = genai.Client(api_key="devtoken", http_options=types.HttpOptions(base_url="http://127.0.0.1:8000"))
+print(client.models.generate_content(model="gemini-3.8-flash-medium", contents="hello").text)
+```
+
+Supported: `contents` (text, `inlineData` images and files), `systemInstruction`, streaming, multi-turn
+chat, `generationConfig` (`maxOutputTokens`, `temperature`, `topP`, `stopSequences`, `thinkingConfig`,
+`responseSchema` / `responseJsonSchema`), function calling (`functionDeclarations`, `functionCall` /
+`functionResponse`, `toolConfig`) and `googleSearch` (as the gateway's web search opt-in).
+Not supported: `fileData` URIs (send files as `inlineData`), `cachedContent`, `candidateCount` > 1,
+`embedContent`. Whether tools and JSON schemas take effect depends on the provider: function calling
+works with Codex and Claude OAuth, and JSON schemas currently only take effect with Antigravity.
 
 ### Example (vision / screenshot)
 

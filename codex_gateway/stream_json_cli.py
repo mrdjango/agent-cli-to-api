@@ -207,3 +207,63 @@ def extract_usage_from_gemini_result(evt: dict) -> dict[str, int] | None:
         "total_tokens": total,
     }
 
+
+
+def extract_agy_delta(evt: dict) -> str:
+    """
+    Antigravity (`agy --output-format stream-json`) streams answer text as
+    `{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"..."}}`.
+    Deltas are already incremental; tool and user_input steps carry no answer text.
+    """
+    if evt.get("event") != "step_update":
+        return ""
+    step = evt.get("step_update")
+    if not isinstance(step, dict) or step.get("step_type") != "agent_response":
+        return ""
+    delta = step.get("text_delta")
+    return delta if isinstance(delta, str) else ""
+
+
+def extract_usage_from_agy_result(evt: dict) -> dict[str, int] | None:
+    # The `result` event carries usage summed over every step of the turn; output_tokens
+    # already includes thinking_tokens.
+    if evt.get("event") != "result":
+        return None
+    result = evt.get("result")
+    if not isinstance(result, dict):
+        return None
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    in_tokens = int(usage.get("input_tokens") or 0)
+    out_tokens = int(usage.get("output_tokens") or 0)
+    return {
+        "prompt_tokens": in_tokens,
+        "completion_tokens": out_tokens,
+        "total_tokens": int(usage.get("total_tokens") or (in_tokens + out_tokens)),
+    }
+
+
+def agy_result_error(evt: dict) -> str | None:
+    """
+    Explain a failed agy turn from its `result` event, or None if it succeeded.
+
+    agy exits 0 when a tool call is auto-denied in headless mode and returns an empty response;
+    the gateway reports that as an error instead of an empty answer.
+    """
+    if evt.get("event") != "result":
+        return None
+    result = evt.get("result")
+    if not isinstance(result, dict):
+        return None
+    if result.get("status") not in (None, "SUCCESS"):
+        return str(result.get("error") or f"agy turn failed: {result.get('status')}")
+    denied = result.get("denied_actions")
+    if denied and not str(result.get("response") or "").strip():
+        names = ", ".join(
+            str(d.get("display_name") or d.get("action"))
+            for d in denied
+            if isinstance(d, dict)
+        )
+        return f"agy produced no answer: tool use was denied ({names or 'unknown tool'})."
+    return None

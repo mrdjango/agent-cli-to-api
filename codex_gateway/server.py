@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import tempfile
 import threading
@@ -50,6 +51,16 @@ from .codex_responses import (
 from .config import DEFAULT_CODEX_ADVERTISED_MODELS, settings
 from .claude_oauth import generate_oauth as claude_oauth_generate
 from .claude_oauth import iter_oauth_stream_events as iter_claude_oauth_events
+from .gemini_compat import (
+    GeminiRequestError,
+    estimate_gemini_tokens,
+    gemini_error_body,
+    gemini_model_resource,
+    gemini_request_to_chat_request,
+    openai_chat_completion_to_gemini_response,
+    openai_stream_to_gemini_responses,
+    split_model_action,
+)
 from .gemini_cloudcode import generate_cloudcode as gemini_cloudcode_generate
 from .gemini_cloudcode import iter_cloudcode_stream_events as iter_gemini_cloudcode_events
 from .gemini_cloudcode import warmup_gemini_caches
@@ -75,9 +86,12 @@ from .openai_compat import (
 )
 from .stream_json_cli import (
     TextAssembler,
+    agy_result_error,
+    extract_agy_delta,
     extract_claude_delta,
     extract_cursor_agent_delta,
     extract_gemini_delta,
+    extract_usage_from_agy_result,
     extract_usage_from_claude_result,
     extract_usage_from_gemini_result,
     iter_stream_json_events,
@@ -227,11 +241,19 @@ def _should_audit_request_headers(path: str, status_code: int) -> bool:
 
 
 def _safe_header_value(name: str, value: str) -> str:
-    sensitive = {"authorization", "cookie", "set-cookie", "x-api-key", "api-key", "proxy-authorization"}
+    sensitive = {"authorization", "cookie", "set-cookie", "x-api-key", "x-goog-api-key", "api-key", "proxy-authorization"}
     if settings.audit_redact_headers and name.lower() in sensitive:
         return "<redacted>"
     limit = 500
     return value if len(value) <= limit else f"{value[:limit]}... (truncated, {len(value)} chars total)"
+
+
+_QUERY_KEY_RE = re.compile(r"(^|&)key=[^&]*")
+
+
+def _redact_query_key(query: str) -> str:
+    # Gemini API clients may send their API key (the gateway token) as `?key=`.
+    return _QUERY_KEY_RE.sub(r"\1key=<redacted>", query or "")
 
 
 def _audit_request_headers(request: Request, client_ip: str, status_code: int) -> None:
@@ -244,7 +266,7 @@ def _audit_request_headers(request: Request, client_ip: str, status_code: int) -
         lname = name.lower()
         if audit_all or lname in allowed:
             headers[lname] = _safe_header_value(lname, value)
-    query = request.url.query
+    query = _redact_query_key(request.url.query)
     print(
         (
             f"[security] request_headers ip={client_ip} status={status_code} "
@@ -439,6 +461,125 @@ def _claude_cli_env() -> dict[str, str] | None:
     return env
 
 
+DEFAULT_AGY_MODEL = "gemini-3.8-flash-medium"
+_AGY_EFFORTS = {"low", "medium", "high", "max"}
+# agy model IDs that already pin an effort level, e.g. gemini-3.1-pro-low or gpt-oss-120b-medium.
+_AGY_EFFORT_SUFFIX_RE = re.compile(r"-(?:low|medium|high|max)$", re.IGNORECASE)
+
+
+def _normalize_agy_effort(raw: str | None) -> str | None:
+    """Map a requested effort to an `agy --effort` level, or None to keep the model's default."""
+    value = (raw or "").strip().lower()
+    if value in {"none", "minimal"}:
+        return "low"
+    if value == "xhigh":
+        return "high"
+    return value if value in _AGY_EFFORTS else None
+
+
+def _response_json_schema(req: ChatCompletionRequest) -> dict | None:
+    """
+    JSON Schema from a request's `response_format: {type: json_schema}`, else None.
+    Schemaless `json_object` is not mapped: agy's structured output only fills declared properties
+    and returns `{}` for a bare object schema.
+    """
+    fmt = (getattr(req, "model_extra", None) or {}).get("response_format")
+    if not isinstance(fmt, dict) or fmt.get("type") != "json_schema":
+        return None
+    spec = fmt.get("json_schema")
+    schema = spec.get("schema") if isinstance(spec, dict) else None
+    return schema if isinstance(schema, dict) and schema.get("properties") else None
+
+
+def _agy_structured_output(evt: dict) -> str | None:
+    """With --json-schema, the answer is `result.structured_output` (the streamed text carries agy's
+    own extra fields)."""
+    result = evt.get("result") if evt.get("event") == "result" else None
+    if isinstance(result, dict) and "structured_output" in result:
+        return json.dumps(result["structured_output"], ensure_ascii=False)
+    return None
+
+
+# agy's built-in web tools run without asking in headless mode. Requests that did not ask for web
+# search run in a workspace whose `.agents/hooks.json` denies them (agy loads hooks from its cwd).
+_AGY_WEB_TOOLS = "search_web|read_url_content"
+_AGY_NO_WEB_HOOKS = {
+    "agent-cli-to-api-no-web": {
+        "PreToolUse": [
+            {
+                "matcher": _AGY_WEB_TOOLS,
+                "hooks": [
+                    {
+                        "command": "echo "
+                        + shlex.quote(
+                            json.dumps(
+                                {
+                                    "decision": "deny",
+                                    "reason": "Web access is off for this request. Answer from your own knowledge.",
+                                }
+                            )
+                        ),
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ]
+    }
+}
+_agy_no_web_dir: str | None = None
+
+
+def _agy_workspace(allow_web: bool) -> str:
+    """Working directory for an agy run: the plain workspace, or one that blocks agy's web tools."""
+    global _agy_no_web_dir
+    if allow_web:
+        return settings.agy_workspace or settings.workspace
+    if _agy_no_web_dir is None or not os.path.isfile(os.path.join(_agy_no_web_dir, ".agents", "hooks.json")):
+        path = tempfile.mkdtemp(prefix="agent-cli-to-api-agy-no-web-")
+        os.makedirs(os.path.join(path, ".agents"))
+        with open(os.path.join(path, ".agents", "hooks.json"), "w", encoding="utf-8") as f:
+            json.dump(_AGY_NO_WEB_HOOKS, f, indent=2)
+        _agy_no_web_dir = path
+    return _agy_no_web_dir
+
+
+def _agy_cli_cmd(
+    model: str | None,
+    prompt: str,
+    effort: str | None = None,
+    json_schema: dict | None = None,
+    allow_web: bool = False,
+) -> list[str]:
+    cmd = [settings.agy_bin, "--output-format", "stream-json", "--disable-slash-commands"]
+    if not allow_web and settings.agy_workspace:
+        # The no-web run's cwd is the hooks directory; keep the operator's workspace readable.
+        cmd.extend(["--add-dir", settings.agy_workspace])
+    if settings.agy_sandbox:
+        cmd.append("--sandbox")
+    cmd.extend(settings.agy_extra_args)
+    if model:
+        cmd.extend(["--model", model])
+    # agy rejects --effort together with an ID that already names an effort level.
+    if effort and not (model and _AGY_EFFORT_SUFFIX_RE.search(model)):
+        cmd.extend(["--effort", effort])
+    if json_schema is not None:
+        cmd.extend(["--json-schema", json.dumps(json_schema, ensure_ascii=False)])
+    # `-p <prompt>` would read a prompt starting with "-" as a flag; the attached form can't.
+    cmd.append(f"--print={prompt}")
+    return cmd
+
+
+async def _guard_agy_result(events):
+    """Turn a failed agy `result` (bad model, denied tool, error status) into an exception."""
+    async with aclosing(events) as inner:
+        async for evt in inner:
+            err = agy_result_error(evt)
+            if err:
+                tag = "agy:invalid_model" if "invalid model selection" in err else "agy:error"
+                raise RuntimeError(f"[{tag}] {err}")
+            yield evt
+
+
 # Loose Claude names such as "opus", "sonnet-5", "opus-5.5" or "claude opus 5.5[1m]".
 _CLAUDE_LOOSE_NAME_RE = re.compile(
     r"^(?:claude[-_ ]?)?(opus|sonnet|haiku|fable)(?:[-_ .]?(\d+)(?:[-_.](\d+))?)?(\[1m\])?$",
@@ -475,10 +616,10 @@ def _strict_model_error(requested_model: str, provider: str, provider_model: str
         return None
     if not requested_model:
         return "A model is required, e.g. gpt-5.6-terra or claude-opus-5-5."
-    if provider not in {"codex", "claude"} or not provider_model:
-        return f"Unknown model '{requested_model}'. Use a Codex model (gpt-...) or a Claude model (claude-..., opus, sonnet, haiku)."
+    if provider not in {"codex", "claude", "antigravity"} or not provider_model:
+        return f"Unknown model '{requested_model}'. Use a Codex model (gpt-...), a Claude model (claude-..., opus, sonnet, haiku) or an Antigravity model (gemini-..., agy:<model>)."
     if provider == "codex" and not _CODEX_MODEL_NAME_RE.match(provider_model):
-        return f"Unknown model '{requested_model}'. Use a Codex model (gpt-...) or a Claude model (claude-..., opus, sonnet, haiku)."
+        return f"Unknown model '{requested_model}'. Use a Codex model (gpt-...), a Claude model (claude-..., opus, sonnet, haiku) or an Antigravity model (gemini-..., agy:<model>)."
     return None
 
 
@@ -538,6 +679,18 @@ def _parse_provider_model(model: str) -> tuple[str, str | None]:
     if raw == "gemini":
         return "gemini", None
 
+    # Antigravity CLI. The prefix reaches every model agy offers, including its Claude and GPT-OSS
+    # models (agy:claude-sonnet-4-6), without taking those bare names from the Claude provider.
+    for prefix in ("antigravity:", "agy:"):
+        if raw.startswith(prefix):
+            inner = raw.split(":", 1)[1].strip()
+            return "antigravity", (inner or None)
+    if raw in {"antigravity", "agy"}:
+        return "antigravity", None
+    # Bare Gemini model IDs (gemini-3.8-flash-high) are only served by agy.
+    if raw.lower().startswith("gemini-"):
+        return "antigravity", raw
+
     # Anthropic-native names (what Anthropic SDKs and Claude Code send) belong to Claude,
     # not Codex; otherwise they would silently be answered by a GPT model.
     claude_model = _normalize_claude_model_name(raw)
@@ -551,12 +704,14 @@ def _normalize_provider(raw: str | None) -> str:
     p = (raw or "").strip().lower()
     if not p:
         return "auto"
-    if p in {"auto", "codex", "cursor-agent", "claude", "gemini"}:
+    if p in {"auto", "codex", "cursor-agent", "claude", "gemini", "antigravity"}:
         return p
     if p in {"cursor", "cursor_agent", "cursoragent"}:
         return "cursor-agent"
     if p in {"claude-code", "claude_code", "claudecode"}:
         return "claude"
+    if p in {"antigravity", "agy"}:
+        return "antigravity"
     return "auto"
 
 
@@ -569,6 +724,8 @@ def _provider_default_model(provider: str) -> str | None:
         return settings.claude_model or "sonnet"
     if provider == "gemini":
         return settings.gemini_model or "gemini-3-flash-preview"
+    if provider == "antigravity":
+        return settings.agy_model or DEFAULT_AGY_MODEL
     return None
 
 
@@ -1104,7 +1261,7 @@ def _extract_upstream_status_code(err: BaseException) -> int | None:
     msg = str(err or "").strip()
     if not msg:
         return None
-    if "unrecognized_model" in msg or "model_substituted" in msg:
+    if "unrecognized_model" in msg or "model_substituted" in msg or "agy:invalid_model" in msg:
         # Claude CLI rejected the requested model name: a client error, not a gateway failure.
         return 400
     for rx in (_UPSTREAM_STATUS_RE, _HTTPX_STATUS_RE, _GENERIC_STATUS_RE):
@@ -1434,6 +1591,9 @@ def _build_curl_command(
     flags = "-sS"
     if stream:
         flags += " -N"
+    base, sep, query = url.partition("?")
+    if sep:
+        url = f"{base}?{_redact_query_key(query)}"
     lines = [f"curl {flags} -X POST {url} \\", "  -H 'Content-Type: application/json' \\"]
     if authorization:
         logged_authorization = "Bearer <redacted>" if settings.log_redact_authorization else authorization
@@ -1946,6 +2106,13 @@ async def _log_startup_config() -> None:
             ("model", settings.gemini_model or "gemini-pro", "blue"),
             ("endpoint", settings.gemini_cloudcode_base_url, "magenta"),
         ])
+    elif provider == "antigravity":
+        items.extend([
+            ("mode", "agy CLI", "yellow"),
+            ("model", settings.agy_model or DEFAULT_AGY_MODEL, "blue"),
+            ("workspace", settings.agy_workspace or settings.workspace, "dim"),
+            ("sandbox", "on" if settings.agy_sandbox else "off", "blue"),
+        ])
     else:
         # Auto or unknown provider
         items.extend([
@@ -1955,7 +2122,7 @@ async def _log_startup_config() -> None:
     # Try rich output
     console = _get_rich_console()
     if console is not None:
-        emoji = {"codex": "🤖", "cursor-agent": "🖱️", "claude": "🧠", "gemini": "✨"}.get(provider, "🚀")
+        emoji = {"codex": "🤖", "cursor-agent": "🖱️", "claude": "🧠", "gemini": "✨", "antigravity": "🪐"}.get(provider, "🚀")
         is_tty = getattr(console, "_is_real_tty", True)
         if is_tty:
             try:
@@ -2025,6 +2192,35 @@ async def healthz():
     return {"ok": True}
 
 
+_agy_models_cache: list[str] | None = None
+
+
+async def _agy_model_ids() -> list[str]:
+    """Model IDs from `agy models` (one fetch per process; empty if agy is missing or fails)."""
+    global _agy_models_cache
+    if _agy_models_cache is not None:
+        return _agy_models_cache
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            settings.agy_bin,
+            "models",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except Exception as e:
+        logger.warning("agy models failed: %s", e)
+        return []
+    ids = [
+        line.split("\t", 1)[0].strip()
+        for line in out.decode(errors="ignore").splitlines()
+        if "\t" in line and line.split("\t", 1)[0].strip()
+    ]
+    if proc.returncode == 0 and ids:
+        _agy_models_cache = ids
+    return ids
+
+
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models(authorization: str | None = Header(default=None)):
@@ -2035,6 +2231,8 @@ async def list_models(authorization: str | None = Header(default=None)):
         models = settings.advertised_models[:]
     elif forced_provider in {"auto", "codex"}:
         models = ["default", default_id, *DEFAULT_CODEX_ADVERTISED_MODELS]
+    elif forced_provider == "antigravity" and settings.allow_client_model_override:
+        models = [default_id, *await _agy_model_ids()]
     elif forced_provider != "auto" and not settings.allow_client_model_override:
         # When the provider is fixed (operator-controlled), the client-sent `model` string is
         # accepted but ignored by default, so we advertise a stable placeholder plus the
@@ -2088,6 +2286,11 @@ async def debug_config(authorization: str | None = Header(default=None)):
         "gemini_project_id": settings.gemini_project_id,
         "gemini_oauth_creds_path": settings.gemini_oauth_creds_path,
         "gemini_oauth_client_id": settings.gemini_oauth_client_id,
+        "agy_bin": settings.agy_bin,
+        "agy_model": settings.agy_model or DEFAULT_AGY_MODEL,
+        "agy_workspace": settings.agy_workspace or settings.workspace,
+        "agy_sandbox": settings.agy_sandbox,
+        "agy_extra_args": settings.agy_extra_args,
         "model_reasoning_effort": settings.model_reasoning_effort,
         "force_reasoning_effort": settings.force_reasoning_effort,
         "enable_search": settings.enable_search,
@@ -2627,6 +2830,110 @@ async def anthropic_messages(
     return _anthropic_error("Gateway returned an unsupported response type", status_code=502)
 
 
+def _gemini_error(message: str, *, status_code: int = 500) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content=gemini_error_body(message, status_code))
+
+
+def _gemini_authorization(request: Request) -> tuple[str | None, JSONResponse | None]:
+    """Gemini clients send the key as `x-goog-api-key` or `?key=`; a Bearer header also works."""
+    key = (request.headers.get("x-goog-api-key") or request.query_params.get("key") or "").strip()
+    authorization = f"Bearer {key}" if key else request.headers.get("authorization")
+    try:
+        _check_auth(authorization)
+    except HTTPException as e:
+        message = "Missing API key: send the gateway token as x-goog-api-key." if e.status_code == 401 else str(e.detail)
+        return None, _gemini_error(message, status_code=e.status_code)
+    return authorization, None
+
+
+@app.get("/v1beta/models")
+async def gemini_list_models(request: Request):
+    authorization, err = _gemini_authorization(request)
+    if err:
+        return err
+    listing = await list_models(authorization)
+    return {"models": [gemini_model_resource(m["id"]) for m in listing["data"] if m["id"] != "default"]}
+
+
+@app.get("/v1beta/models/{model_id:path}")
+async def gemini_get_model(model_id: str, request: Request):
+    _, err = _gemini_authorization(request)
+    if err:
+        return err
+    return gemini_model_resource(model_id.removeprefix("models/"))
+
+
+@app.post("/v1beta/models/{model_action:path}")
+@app.post("/v1/models/{model_action:path}")
+async def gemini_generate_content(model_action: str, request: Request):
+    authorization, err = _gemini_authorization(request)
+    if err:
+        return err
+    try:
+        model, action = split_model_action(model_action)
+    except GeminiRequestError as e:
+        return _gemini_error(str(e), status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return _gemini_error("Request body must be valid JSON.", status_code=400)
+    if action == "countTokens":
+        if not isinstance(body, dict):
+            return _gemini_error("Request body must be a JSON object.", status_code=400)
+        # countTokens may wrap the request as {"generateContentRequest": {...}}.
+        inner = body.get("generateContentRequest") or body.get("generate_content_request") or body
+        return {"totalTokens": estimate_gemini_tokens(inner if isinstance(inner, dict) else body)}
+
+    stream = action == "streamGenerateContent"
+    try:
+        chat_req = gemini_request_to_chat_request(body, model=model, stream=stream)
+    except GeminiRequestError as e:
+        return _gemini_error(str(e), status_code=400)
+    if stream:
+        chat_req = _with_stream_usage(chat_req)
+    try:
+        result = await chat_completions(chat_req, request, authorization)
+    except HTTPException as e:
+        return _gemini_error(str(e.detail), status_code=e.status_code)
+
+    if isinstance(result, JSONResponse):
+        try:
+            payload = json.loads(result.body.decode("utf-8"))
+        except Exception:
+            return _gemini_error("Gateway returned an invalid JSON response", status_code=502)
+        if result.status_code >= 400:
+            return _gemini_error(_extract_error_message(payload), status_code=result.status_code)
+        result = payload
+    if isinstance(result, dict):
+        return openai_chat_completion_to_gemini_response(result, model=model)
+
+    if isinstance(result, StreamingResponse):
+        # SDKs ask for `?alt=sse`; without it the Gemini API streams one JSON array.
+        use_sse = request.query_params.get("alt") == "sse"
+
+        async def gemini_stream_gen():
+            first = True
+            async for item in openai_stream_to_gemini_responses(result.body_iterator, model=model):
+                if use_sse:
+                    yield f"data: {json.dumps(item, ensure_ascii=False)}\r\n\r\n"
+                else:
+                    yield ("[" if first else ",\r\n") + json.dumps(item, ensure_ascii=False)
+                first = False
+            if not use_sse:
+                yield "]" if not first else "[]"
+
+        stream_headers = dict(result.headers)
+        stream_headers.pop("content-length", None)
+        stream_headers.pop("content-type", None)
+        return StreamingResponse(
+            gemini_stream_gen(),
+            media_type="text/event-stream" if use_sse else "application/json",
+            headers=stream_headers,
+        )
+
+    return _gemini_error("Gateway returned an unsupported response type", status_code=502)
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(
@@ -2740,6 +3047,8 @@ async def chat_completions(
             mode_label = "claude-oauth"
         elif provider == "gemini" and use_gemini_cloudcode:
             mode_label = "gemini-cloudcode"
+        elif provider == "antigravity":
+            mode_label = "agy-cli"
 
         effort_source = "default"
         if forced_effort:
@@ -2758,6 +3067,16 @@ async def chat_completions(
             if claude_effort and _normalize_claude_effort(forced_effort_raw):
                 logged_effort_source = "forced"
             elif claude_effort:
+                logged_effort_source = "request"
+            else:
+                logged_effort_source = "default"
+        # Same for agy: only a forced or requested effort is passed, and only for base model IDs.
+        agy_effort = _normalize_agy_effort(forced_effort_raw) or _normalize_agy_effort(request_effort_raw)
+        if provider == "antigravity":
+            logged_effort = agy_effort or "model-default"
+            if agy_effort and _normalize_agy_effort(forced_effort_raw):
+                logged_effort_source = "forced"
+            elif agy_effort:
                 logged_effort_source = "request"
             else:
                 logged_effort_source = "default"
@@ -2880,6 +3199,31 @@ async def chat_completions(
 
         def _evt_log(evt: dict) -> None:
             if not settings.log_events:
+                return
+            if provider == "antigravity":
+                step = evt.get("step_update") if isinstance(evt.get("step_update"), dict) else {}
+                if evt.get("event") == "init":
+                    init = evt.get("init") if isinstance(evt.get("init"), dict) else {}
+                    logger.info(
+                        "[%s] agy init model=%s permission_mode=%s conversation_id=%s",
+                        resp_id,
+                        init.get("model"),
+                        init.get("permission_mode"),
+                        evt.get("conversation_id"),
+                    )
+                elif step.get("step_type") == "tool" and step.get("state") in {"DONE", "ERROR"}:
+                    logger.info(
+                        "[%s] agy tool %s state=%s", resp_id, step.get("tool_name"), step.get("state")
+                    )
+                elif evt.get("event") == "result":
+                    result = evt.get("result") if isinstance(evt.get("result"), dict) else {}
+                    logger.info(
+                        "[%s] agy result status=%s turns=%s usage=%s",
+                        resp_id,
+                        result.get("status"),
+                        result.get("num_turns"),
+                        result.get("usage"),
+                    )
                 return
             t = evt.get("type")
             if isinstance(t, str) and t.startswith("response."):
@@ -3231,6 +3575,33 @@ async def chat_completions(
                                 if maybe_usage:
                                     usage = maybe_usage
                             text = assembler.text
+                    elif provider == "antigravity":
+                        agy_model = provider_model or settings.agy_model or DEFAULT_AGY_MODEL
+                        agy_schema = _response_json_schema(req)
+                        agy_web = _search_enabled_for(req)
+                        cmd = _agy_cli_cmd(agy_model, prompt, agy_effort, agy_schema, allow_web=agy_web)
+                        parts: list[str] = []
+                        fallback_text = None
+                        structured = None
+                        async for evt in _guard_agy_result(
+                            iter_stream_json_events(
+                                cmd=cmd,
+                                env=None,
+                                timeout_seconds=settings.timeout_seconds,
+                                stream_limit=settings.subprocess_stream_limit,
+                                event_callback=_evt_log,
+                                stderr_callback=_stderr_log,
+                                cwd=_agy_workspace(agy_web),
+                            )
+                        ):
+                            parts.append(extract_agy_delta(evt))
+                            maybe_usage = extract_usage_from_agy_result(evt)
+                            if maybe_usage:
+                                usage = maybe_usage
+                            if evt.get("event") == "result" and isinstance(evt.get("result"), dict):
+                                fallback_text = evt["result"].get("response")
+                                structured = _agy_structured_output(evt)
+                        text = structured or "".join(parts) or str(fallback_text or "")
                     else:
                         raise RuntimeError(f"Unknown provider: {provider}")
             finally:
@@ -3491,6 +3862,22 @@ async def chat_completions(
                                     event_callback=_evt_log,
                                     stderr_callback=_stderr_log,
                                 )
+                        elif provider == "antigravity":
+                            agy_model = provider_model or settings.agy_model or DEFAULT_AGY_MODEL
+                            agy_schema = _response_json_schema(req)
+                            agy_web = _search_enabled_for(req)
+                            cmd = _agy_cli_cmd(agy_model, prompt, agy_effort, agy_schema, allow_web=agy_web)
+                            events = _guard_agy_result(
+                                iter_stream_json_events(
+                                    cmd=cmd,
+                                    env=None,
+                                    timeout_seconds=settings.timeout_seconds,
+                                    stream_limit=settings.subprocess_stream_limit,
+                                    event_callback=_evt_log,
+                                    stderr_callback=_stderr_log,
+                                    cwd=_agy_workspace(agy_web),
+                                )
+                            )
                         else:
                             raise RuntimeError(f"Unknown provider: {provider}")
 
@@ -3641,6 +4028,13 @@ async def chat_completions(
                                 elif provider == "gemini":
                                     delta = _maybe_strip_answer_tags(extract_gemini_delta(evt, assembler))
                                     stream_usage = extract_usage_from_gemini_result(evt) or stream_usage
+                                elif provider == "antigravity":
+                                    if agy_schema is None:
+                                        delta = _maybe_strip_answer_tags(extract_agy_delta(evt))
+                                    else:
+                                        # Structured output arrives whole on the result event.
+                                        delta = _agy_structured_output(evt) or ""
+                                    stream_usage = extract_usage_from_agy_result(evt) or stream_usage
 
                                 if delta:
                                     sent_content = True

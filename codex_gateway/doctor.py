@@ -34,10 +34,12 @@ def _normalize_provider(raw: str | None) -> str:
     p = (raw or "").strip().lower()
     if not p:
         return "auto"
-    if p in {"auto", "codex", "gemini", "claude", "cursor-agent"}:
+    if p in {"auto", "codex", "gemini", "claude", "cursor-agent", "antigravity"}:
         return p
     if p in {"cursor", "cursoragent", "cursor_agent"}:
         return "cursor-agent"
+    if p in {"antigravity", "agy"}:
+        return "antigravity"
     return "auto"
 
 
@@ -146,6 +148,10 @@ async def run_doctor() -> int:
     cursor_bin = _check_binary("cursor-agent", "cursor-agent", required=(provider == "cursor-agent"))
     cursor_ready = cursor_bin.ok
 
+    # agy keeps its Google sign-in internally; the binary check is the reliable signal.
+    agy_bin = _check_binary("agy", os.environ.get("AGY_BIN", "agy"), required=(provider == "antigravity"))
+    agy_ready = agy_bin.ok
+
     checks: list[CheckResult] = []
 
     # Surface invalid boolean env values explicitly (avoid silent fallback).
@@ -169,6 +175,8 @@ async def run_doctor() -> int:
             checks.append(await _check_claude_oauth_refreshable(required=False))
     elif provider == "cursor-agent":
         checks.append(cursor_bin)
+    elif provider == "antigravity":
+        checks.append(agy_bin)
     else:
         checks.extend(
             [
@@ -179,6 +187,7 @@ async def run_doctor() -> int:
                 _check_binary("claude", "claude", required=False),
                 await _check_claude_oauth_refreshable(required=False),
                 _check_binary("cursor-agent", "cursor-agent", required=False),
+                _check_binary("agy", os.environ.get("AGY_BIN", "agy"), required=False),
             ]
         )
 
@@ -194,7 +203,7 @@ async def run_doctor() -> int:
     warnings = any((not c.ok) and (not c.required) for c in checks)
 
     if provider == "auto":
-        if not (codex_ready or gemini_ready or claude_ready or cursor_ready):
+        if not (codex_ready or gemini_ready or claude_ready or cursor_ready or agy_ready):
             required_failed = True
 
     if required_failed:
